@@ -2,6 +2,8 @@
 sudo apt update -y
 sudo apt upgrade -y
 
+sudo apt install curl
+
 # Enable AppImages
 sudo apt-get install fuse libfuse2
 # Install AppImageLauncher
