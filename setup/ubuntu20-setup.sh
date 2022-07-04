@@ -8,6 +8,8 @@ sudo apt install vlc ubuntu-restricted-extras libdvd-pkg ubuntu-restricted-addon
 sudo dpkg-reconfigure libdvd-pkg
 # Gnome Tweak tools
 sudo apt install gnome-tweak-tool dconf-editor
+# Enable 'minimize-on-click' for Dock
+gsettings set org.gnome.shell.extensions.dash-to-dock click-action 'minimize'
 
 # Enable AppImages
 sudo apt-get install fuse libfuse2
