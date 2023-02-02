@@ -44,3 +44,6 @@ do
 done
 
 echo ""
+
+#TODO: print only folder name and add -p for full path
+#TODO: add file size
