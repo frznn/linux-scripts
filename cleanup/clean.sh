@@ -25,6 +25,9 @@ deborphan | xargs sudo apt-get -y remove --purge
 #Free up space by clean out the cached packages
 apt-get clean
 
+# Remove old logs
+sudo journalctl --vacuum-time=7days
+
 # Remove the Trash
 rm -rf /home/*/.local/share/Trash/*/**
 rm -rf /root/.local/share/Trash/*/**
