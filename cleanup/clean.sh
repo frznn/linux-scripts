@@ -16,12 +16,8 @@ do
 done
 
 #Getting rid of partial packages
-apt-get clean && apt-get autoclean
-apt-get remove --purge -y software-properties-common
-
-#Getting rid of no longer required packages
-apt-get autoremove -y
-
+sudo apt clean && apt autoclean
+sudo apt autoremove -y
 
 #Getting rid of orphaned packages
 deborphan | xargs sudo apt-get -y remove --purge
