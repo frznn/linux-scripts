@@ -3,6 +3,9 @@
 #Check the Drive Space Used by Cached Files
 du -sh /var/cache/apt/archives
 
+#Delete cache file older than 30 days
+find ~/.cache/ -type f -atime +30 -delete
+
 #Clean all the log file
 #for logs in `find /var/log -type f`;  do > $logs; done
 
