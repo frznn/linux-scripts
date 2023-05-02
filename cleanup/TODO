@@ -1,0 +1,17 @@
+- Calculate freed-up space
+
+#Rust
+- Remove rust unused toolchains
+	1. rustup show
+	2. get installed
+	3. ignore active
+	4. remove list
+		rustup toolchain remove TOOLCHAIN_1 TOOLCHAIN_2 ...
+
+	cd ~/.rustup/toolchains/
+	for i in nightly-*; do rustup toolchain remove ${i/%-x86_64-unknown-linux-gnu}; done
+	
+#Brave
+- Delete all profile caches: 
+  ~/.config/BraveSoftware/BraveBrowser/Profile*/Service Worker/CacheStorage
+  ~/.cache/BraveSoftware/Brave-Browser
