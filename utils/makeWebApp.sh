@@ -29,3 +29,7 @@ Exec=$path/$NAME
 Icon=$path/resources/app/icon.png" > $NAME.desktop
 
 sudo desktop-file-install $NAME.desktop
+
+#TODO: uninstall
+# /usr/share/applications
+# rm APP.desktop
