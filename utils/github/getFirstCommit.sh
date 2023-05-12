@@ -3,7 +3,7 @@
 # Check repo argument
 if [ "$#" -lt 2 ]; then
     echo "USAGE: $0 ORG REPO_NAME TOKEN"
-    return
+    exit 1
 fi
 
 # Set organization name and GitHub API token
@@ -41,6 +41,6 @@ if [[ $header == *"link"* ]]; then
 fi
 
 # Print first commit's author
-echo $commits | jq '.[-1].commit.author.name'
+echo $commits | jq '.[-1]'
 
-return
+exit 0
