@@ -14,7 +14,12 @@ fi
 NAME=$1
 WEBSITE=$2
 
-nativefier --name $NAME --platform linux --arch x64 --width 1024 --height 768--tray --disable-dev-tools  --single-instance $WEBSITE
+ARGS=""
+#ARGS="--disable-dev-tools"
+#ARGS="--tray"
+#DRM="-e 15.3.5 --widevine"
+
+nativefier --name $NAME --platform linux --arch x64 --width 1024 --height 768 --disable-dev-tools --single-instance $WEBSITE
 
 mv "$NAME-linux-x64" "$NAME"
 
@@ -30,6 +35,13 @@ Icon=$path/resources/app/icon.png" > $NAME.desktop
 
 sudo desktop-file-install $NAME.desktop
 
+exit 0
+
 #TODO: uninstall
-# /usr/share/applications
-# rm APP.desktop
+APP=
+rm /usr/share/applications/$APP.desktop
+rm $HOME/.local/share/applications/$APP.desktop
+
+# rm cache:
+#make APP lowercase
+rm -rf ~/.config/$APP-nativefier-*
