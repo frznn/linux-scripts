@@ -14,12 +14,12 @@ fi
 NAME=$1
 WEBSITE=$2
 
-ARGS=""
+#ARGS=""
 #ARGS="--disable-dev-tools"
-#ARGS="--tray"
+ARGS="--tray"
 #DRM="-e 15.3.5 --widevine"
 
-nativefier --name $NAME --platform linux --arch x64 --width 1024 --height 768 --disable-dev-tools --single-instance $WEBSITE
+nativefier --name $NAME --platform linux --arch x64 --width 1024 --height 768 $ARGS $DRM --single-instance $WEBSITE
 
 mv "$NAME-linux-x64" "$NAME"
 

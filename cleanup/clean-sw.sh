@@ -11,9 +11,9 @@ LANG=en_US.UTF-8 snap list --all | awk '/disabled/{print $1, $3}' |
         sudo snap remove "$snapname" --revision="$revision"
     done
 
-#Spotify
-#Delete cache
-cd $HOME/.cache/spotify/
+#Spotify - Delete cache
+#cd $HOME/.cache/spotify/
+cd ~/snap/spotify/common/.cache/spotify
 #Delete storage
 rm -rf Browser Data Storage
 
