@@ -1,0 +1,114 @@
+#!/bin/bash
+#
+# update-discord
+# Keeps Discord up to date on Debian/Ubuntu systems.
+# It checks the latest stable .deb version and only installs if newer.
+#
+# Manual run:
+#   ./update-discord
+#
+# Install as a daily routine (recommended: systemd timer):
+# 1) Install this script to a stable path and make it executable:
+#      sudo install -m 755 update-discord /usr/local/bin/update-discord
+# 2) Create /etc/systemd/system/update-discord.service with:
+#      [Unit]
+#      Description=Update Discord package if newer version is available
+#      Wants=network-online.target
+#      After=network-online.target
+#      [Service]
+#      Type=oneshot
+#      ExecStart=/usr/local/bin/update-discord
+# 3) Create /etc/systemd/system/update-discord.timer with:
+#      [Unit]
+#      Description=Run update-discord daily
+#      [Timer]
+#      OnCalendar=*-*-* 09:00:00
+#      Persistent=true
+#      Unit=update-discord.service
+#      [Install]
+#      WantedBy=timers.target
+# 4) Enable the timer:
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now update-discord.timer
+# 5) Verify:
+#      systemctl status update-discord.timer
+#      systemctl list-timers --all | grep update-discord
+#
+# Cron alternative (runs daily at 09:00):
+#   0 9 * * * /usr/local/bin/update-discord >> /var/log/update-discord.log 2>&1
+set -euo pipefail
+
+DOWNLOAD_URL="https://discord.com/api/download/stable?platform=linux&format=deb"
+TMP_DEB="/tmp/discord.deb"
+
+if [[ "${EUID}" -eq 0 ]]; then
+  AS_ROOT=()
+elif command -v sudo >/dev/null 2>&1; then
+  AS_ROOT=(sudo)
+else
+  echo "This script needs root privileges to install packages." >&2
+  exit 1
+fi
+
+get_latest_url() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSLI -o /dev/null -w '%{url_effective}' -L "$DOWNLOAD_URL"
+    return
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    wget -q --server-response --spider "$DOWNLOAD_URL" 2>&1 \
+      | awk '/^  Location: / {print $2}' \
+      | tr -d '\r' \
+      | tail -n1
+    return
+  fi
+
+  echo "Neither curl nor wget is installed." >&2
+  exit 1
+}
+
+download_latest_deb() {
+  if command -v wget >/dev/null 2>&1; then
+    wget -O "$TMP_DEB" "$DOWNLOAD_URL"
+    return
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL "$DOWNLOAD_URL" -o "$TMP_DEB"
+    return
+  fi
+
+  echo "Neither wget nor curl is installed." >&2
+  exit 1
+}
+
+latest_url="$(get_latest_url)"
+latest_version="$(basename "$latest_url" | sed -E 's/^discord-([0-9.]+)\.deb$/\1/')"
+
+if [[ -z "$latest_version" || "$latest_version" == "$(basename "$latest_url")" ]]; then
+  echo "Could not determine latest Discord version from URL: $latest_url" >&2
+  exit 1
+fi
+
+if installed_version="$(dpkg-query -W -f='${Version}' discord 2>/dev/null)"; then
+  if dpkg --compare-versions "$installed_version" ge "$latest_version"; then
+    echo "Discord is already up to date ($installed_version)."
+    exit 0
+  fi
+
+  echo "Update available: $installed_version -> $latest_version"
+else
+  echo "Discord is not installed. Installing $latest_version."
+fi
+
+echo "Downloading Discord $latest_version..."
+download_latest_deb
+
+echo "Installing Discord..."
+"${AS_ROOT[@]}" dpkg -i "$TMP_DEB" || "${AS_ROOT[@]}" apt -f install -y
+
+echo "Cleaning up..."
+rm -f "$TMP_DEB"
+
+echo "✅ Discord is now at $latest_version."
