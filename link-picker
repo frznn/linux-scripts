@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+URL_ARGS=("$@")
+BRAVE_BIN="/usr/bin/brave-browser"
+BRAVE_LOCAL_STATE="$HOME/.config/BraveSoftware/Brave-Browser/Local State"
+FIREFOX_BIN="/snap/bin/firefox"
+FIREFOX_PROFILES_INI="$HOME/.mozilla/firefox/profiles.ini"
+
+# Geometry "WxH+X+Y" centered on the primary monitor (or first connected if no primary).
+geom() {
+  local w=$1 h=$2
+  xrandr --query 2>/dev/null | awk -v w="$w" -v h="$h" '
+    /^[A-Za-z0-9_-]+ connected primary/ { primary=$0 }
+    /^[A-Za-z0-9_-]+ connected/ && !first { first=$0 }
+    END {
+      line = (primary != "") ? primary : first
+      if (match(line, /([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)/, m))
+        printf "%dx%d+%d+%d", w, h, m[3]+(m[1]-w)/2, m[4]+(m[2]-h)/2
+    }'
+}
+
+pick_brave_profile() {
+  mapfile -t entries < <(
+    jq -r '.profile.info_cache | to_entries[] | "\(.key)|\(.value.name)"' \
+      "$BRAVE_LOCAL_STATE" | sort -t'|' -k2,2
+  )
+  local args=() e
+  for e in "${entries[@]}"; do
+    args+=("${e%%|*}" "${e#*|}")
+  done
+  yad --list \
+    --title="Open in Brave" --text="Profile:" \
+    --column="dir" --column="Profile" \
+    --hide-column=1 --print-column=1 \
+    --separator="" --no-headers \
+    --geometry="$(geom 380 500)" \
+    "${args[@]}" 2>/dev/null
+}
+
+pick_firefox_profile() {
+  mapfile -t names < <(
+    awk '/^\[Profile/{flag=1} flag && /^Name=/{sub(/^Name=/,""); print; flag=0}' \
+      "$FIREFOX_PROFILES_INI" | sort
+  )
+  yad --list \
+    --title="Open in Firefox" --text="Profile:" \
+    --column="Profile" \
+    --separator="" --no-headers \
+    --geometry="$(geom 380 320)" \
+    "${names[@]}" 2>/dev/null
+}
+
+browser=$(yad --list \
+  --title="Open link" --text="Browser:" \
+  --column="Browser" \
+  --separator="" --no-headers \
+  --geometry="$(geom 280 230)" \
+  "Brave" "Firefox" 2>/dev/null) || exit 0
+
+case "$browser" in
+  Brave)
+    p=$(pick_brave_profile) || exit 0
+    [ -z "$p" ] && exit 0
+    exec "$BRAVE_BIN" --profile-directory="$p" "${URL_ARGS[@]}"
+    ;;
+  Firefox)
+    if pgrep -x firefox >/dev/null; then
+      exec "$FIREFOX_BIN" "${URL_ARGS[@]}"
+    fi
+    p=$(pick_firefox_profile) || exit 0
+    [ -z "$p" ] && exit 0
+    exec "$FIREFOX_BIN" -P "$p" "${URL_ARGS[@]}"
+    ;;
+esac
