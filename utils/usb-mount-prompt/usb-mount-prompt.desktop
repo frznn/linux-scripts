@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=USB mount prompt
+Comment=Ask read-only / read-write when a USB disk is connected
+Exec=/home/frznn/.local/bin/usb-mount-prompt.sh
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
