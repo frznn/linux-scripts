@@ -4,7 +4,7 @@ set -euo pipefail
 URL_ARGS=("$@")
 BRAVE_BIN="/usr/bin/brave-browser"
 BRAVE_LOCAL_STATE="$HOME/.config/BraveSoftware/Brave-Browser/Local State"
-FIREFOX_BIN="/snap/bin/firefox"
+FIREFOX_BIN="/usr/bin/firefox"
 FIREFOX_PROFILES_INI="$HOME/.mozilla/firefox/profiles.ini"
 
 # Geometry "WxH+X+Y" centered on the primary monitor (or first connected if no primary).
