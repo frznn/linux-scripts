@@ -40,14 +40,32 @@ set -euo pipefail
 
 DOWNLOAD_URL="https://discord.com/api/download/stable?platform=linux&format=deb"
 TMP_DEB="/tmp/discord.deb"
+CHECK_ONLY=false
 
-if [[ "${EUID}" -eq 0 ]]; then
-  AS_ROOT=()
-elif command -v sudo >/dev/null 2>&1; then
-  AS_ROOT=(sudo)
-else
-  echo "This script needs root privileges to install packages." >&2
-  exit 1
+for arg in "$@"; do
+  case "$arg" in
+    --check) CHECK_ONLY=true ;;
+  esac
+done
+
+send_notification() {
+  local summary="$1" body="$2"
+  if command -v notify-send >/dev/null 2>&1; then
+    DISPLAY="${DISPLAY:-:0}" \
+    DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
+    notify-send "$summary" "$body" || true
+  fi
+}
+
+if ! $CHECK_ONLY; then
+  if [[ "${EUID}" -eq 0 ]]; then
+    AS_ROOT=()
+  elif command -v sudo >/dev/null 2>&1; then
+    AS_ROOT=(sudo)
+  else
+    echo "This script needs root privileges to install packages." >&2
+    exit 1
+  fi
 fi
 
 get_latest_url() {
@@ -98,8 +116,16 @@ if installed_version="$(dpkg-query -W -f='${Version}' discord 2>/dev/null)"; the
   fi
 
   echo "Update available: $installed_version -> $latest_version"
+  if $CHECK_ONLY; then
+    send_notification "Discord update available" "$installed_version → $latest_version"
+    exit 0
+  fi
 else
   echo "Discord is not installed. Installing $latest_version."
+  if $CHECK_ONLY; then
+    send_notification "Discord not installed" "Version $latest_version is available."
+    exit 0
+  fi
 fi
 
 echo "Downloading Discord $latest_version..."
