@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# claude-session — manage Claude Code session transcripts.
+#
+# Sessions are stored as  ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
+# (plus an optional <uuid>/ sidecar dir). This tool lists them, marks the
+# current session for deletion, and reaps marked sessions on the NEXT launch
+# (so a live transcript is never deleted while it is still being written).
+#
+# An <id> is a full session UUID or any unambiguous PREFIX of one — e.g. the
+# short id shown by `list` (the first block). An ambiguous prefix is rejected
+# and its candidates are listed, so nothing is deleted by guess.
+#
+# Subcommands:
+#   list [-l]            show sessions newest-first: short-id · title; [MARKED] = queued.
+#                        -l / --long prints full UUIDs instead of short ids.
+#   mark   [<id>]        queue a session for deletion (default: $CLAUDE_SESSION_ID)
+#   unmark <id>          remove a session from the deletion queue
+#   marked               print the raw deletion queue
+#   delete [-f] <id>...  delete transcript(s) RIGHT NOW; refuses a LIVE session
+#                        (one a running Claude Code owns) unless -f/--force is given
+#   reap   [<current>]   delete every marked session except <current> (used by the hook)
+#
+# Env overrides: CLAUDE_PROJECTS_DIR, CLAUDE_REAP_LIST, CLAUDE_SESSION_ID.
+set -euo pipefail
+
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+REAP_LIST="${CLAUDE_REAP_LIST:-$HOME/.claude/reap-sessions}"
+
+die() { echo "claude-session: $*" >&2; exit 1; }
+
+# Emit the transcript file and sidecar dir belonging to a session id (if any).
+paths_for() {
+  local id="$1"
+  [ -d "$PROJECTS_DIR" ] || return 0
+  find "$PROJECTS_DIR" -maxdepth 2 \( -name "$id.jsonl" -o -name "$id" \) 2>/dev/null || true
+}
+
+# Read the queue into $1 (nameref), skipping blanks and # comments.
+read_queue() {
+  local -n _out="$1"; _out=()
+  [ -f "$REAP_LIST" ] || return 0
+  local line
+  while IFS= read -r line; do
+    case "$line" in ''|\#*) continue;; esac
+    _out+=("$line")
+  done < "$REAP_LIST"
+}
+
+# Latest AI-generated title for a session transcript ("" if none / no jq).
+title_for() {
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -r 'select(.type=="ai-title") | .aiTitle // empty' "$1" 2>/dev/null | tail -1
+}
+
+# All known session ids (basenames of the transcript files).
+all_ids() {
+  [ -d "$PROJECTS_DIR" ] || return 0
+  find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' -printf '%f\n' 2>/dev/null | sed 's/\.jsonl$//'
+}
+
+# Resolve <query> against candidate ids on stdin. Prints the full id and returns
+# 0 on an exact or unique-prefix match; returns 1 if nothing matches; or prints
+# the candidates to stderr and returns 2 if the prefix is ambiguous.
+_resolve() {
+  local q="$1" line; local -a hits=()
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$line" = "$q" ] && { printf '%s\n' "$line"; return 0; }
+    case "$line" in "$q"*) hits+=("$line");; esac
+  done
+  case "${#hits[@]}" in
+    1) printf '%s\n' "${hits[0]}"; return 0;;
+    0) return 1;;
+    *) { echo "claude-session: ambiguous id '$q' — matches:"; printf '  %s\n' "${hits[@]}"; } >&2; return 2;;
+  esac
+}
+
+# Session ids that are currently LIVE. Claude Code writes one
+# ~/.claude/sessions/<pid>.json per running process (with its .sessionId); we
+# trust an entry only if <pid> is still a running process (skips stale/crashed
+# files). Also includes this command's own session from the environment.
+LIVE_REGISTRY="${CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
+live_ids() {
+  {
+    if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then echo "$CLAUDE_CODE_SESSION_ID"; fi
+    if [ -n "${CLAUDE_SESSION_ID:-}" ]; then echo "$CLAUDE_SESSION_ID"; fi
+    if [ -d "$LIVE_REGISTRY" ]; then
+      local f pid sid
+      for f in "$LIVE_REGISTRY"/*.json; do
+        [ -e "$f" ] || continue
+        pid="$(basename "$f" .json)"
+        case "$pid" in *[!0-9]*|'') continue;; esac   # only numeric <pid>.json
+        [ -d "/proc/$pid" ] || continue               # skip stale (dead pid)
+        if command -v jq >/dev/null 2>&1; then
+          sid="$(jq -r '.sessionId // empty' "$f" 2>/dev/null)"
+        else
+          sid="$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)"
+        fi
+        if [ -n "$sid" ]; then echo "$sid"; fi
+      done
+    fi
+  } | sort -u
+}
+
+cmd_list() {
+  local long=0
+  case "${1:-}" in -l|--long) long=1;; esac
+  local -a marked; read_queue marked
+  local id show sz mt flag rest f title
+  find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | while read -r _ f; do
+      id="$(basename "$f" .jsonl)"
+      if [ "$long" = 1 ]; then show="$id"; else show="${id%%-*}"; fi
+      sz="$(du -h "$f" 2>/dev/null | cut -f1)"
+      mt="$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+      title="$(title_for "$f")"
+      flag=""
+      for rest in "${marked[@]:-}"; do [ "$rest" = "$id" ] && { flag="  [MARKED]"; break; }; done
+      printf '%s  %5s  %-8s  %s%s\n' "$mt" "${sz:-?}" "$show" "${title:-(untitled)}" "$flag"
+    done
+}
+
+cmd_marked() {
+  local -a marked; read_queue marked
+  [ "${#marked[@]}" -gt 0 ] || { echo "(deletion queue empty)"; return 0; }
+  printf '%s\n' "${marked[@]}"
+}
+
+cmd_mark() {
+  local q="${1:-${CLAUDE_SESSION_ID:-}}"
+  [ -n "$q" ] || die "no session id given and CLAUDE_SESSION_ID not set"
+  local id rc=0
+  if [[ "$q" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    id="$q"                       # full uuid: accept as-is (covers the live session)
+  else
+    id="$(all_ids | _resolve "$q")" || rc=$?
+  fi
+  [ "$rc" = 2 ] && exit 1
+  { [ "$rc" = 0 ] && [ -n "$id" ]; } || die "no session matches '$q'"
+  touch "$REAP_LIST"
+  if grep -qxF "$id" "$REAP_LIST" 2>/dev/null; then
+    echo "already queued: $id"
+  else
+    printf '%s\n' "$id" >> "$REAP_LIST"
+    echo "queued for deletion (reaped on next Claude Code launch): $id"
+  fi
+}
+
+cmd_unmark() {
+  local q="${1:?usage: claude-session unmark <id>}"
+  [ -f "$REAP_LIST" ] || { echo "(queue empty)"; return 0; }
+  local id rc=0
+  id="$(grep -vE '^[[:space:]]*($|#)' "$REAP_LIST" | _resolve "$q")" || rc=$?
+  [ "$rc" = 2 ] && exit 1
+  { [ "$rc" = 0 ] && [ -n "$id" ]; } || die "no queued session matches '$q'"
+  _dequeue "$id"
+  echo "unqueued: $id"
+}
+
+# Remove one id from the queue file (no-op if absent).
+_dequeue() {
+  local id="$1"
+  [ -f "$REAP_LIST" ] || return 0
+  grep -vxF "$id" "$REAP_LIST" > "$REAP_LIST.tmp" 2>/dev/null || true
+  mv "$REAP_LIST.tmp" "$REAP_LIST"
+}
+
+cmd_delete() {
+  local force=0
+  case "${1:-}" in -f|--force) force=1; shift;; esac
+  [ "$#" -ge 1 ] || die "usage: claude-session delete [-f] <id> [id...]"
+  local live; live="$(live_ids)"
+  local q id rc p found err=0
+  for q in "$@"; do
+    rc=0; id="$(all_ids | _resolve "$q")" || rc=$?
+    [ "$rc" = 2 ] && { err=1; continue; }           # ambiguous — candidates already listed
+    if [ "$rc" != 0 ] || [ -z "$id" ]; then echo "not found: $q"; err=1; continue; fi
+    if [ "$force" != 1 ] && printf '%s\n' "$live" | grep -qxF "$id"; then
+      echo "refusing: '$id' looks LIVE (a Claude Code session is running it)." >&2
+      echo "  use 'mark' to delete it safely on next launch, or 'delete -f' to force." >&2
+      err=1; continue
+    fi
+    found=0
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      rm -rf -- "$p"; found=1
+    done < <(paths_for "$id")
+    _dequeue "$id"
+    if [ "$found" = 1 ]; then echo "deleted: $id"; else echo "not found: $id"; err=1; fi
+  done
+  return "$err"
+}
+
+cmd_reap() {
+  local current="${1:-${CLAUDE_SESSION_ID:-}}"
+  local -a marked; read_queue marked
+  [ "${#marked[@]}" -gt 0 ] || return 0
+  local -a kept=()
+  local id p found reaped=0
+  for id in "${marked[@]}"; do
+    if [ -n "$current" ] && [ "$id" = "$current" ]; then kept+=("$id"); continue; fi
+    found=0
+    while IFS= read -r p; do [ -n "$p" ] || continue; rm -rf -- "$p"; found=1; done < <(paths_for "$id")
+    reaped=$((reaped+1))
+    [ "$found" = 1 ] && echo "claude-session: reaped $id" >&2
+  done
+  : > "$REAP_LIST"
+  [ "${#kept[@]}" -gt 0 ] && printf '%s\n' "${kept[@]}" >> "$REAP_LIST"
+  [ "$reaped" -gt 0 ] && echo "claude-session: reaped $reaped marked session(s)" >&2
+  return 0
+}
+
+# Dispatch only when executed directly, so helpers can be sourced for testing.
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+  sub="${1:-list}"; shift || true
+  case "$sub" in
+    list)   cmd_list "$@";;
+    marked) cmd_marked "$@";;
+    mark)   cmd_mark "$@";;
+    unmark) cmd_unmark "$@";;
+    delete) cmd_delete "$@";;
+    reap)   cmd_reap "$@";;
+    -h|--help|help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0";;
+    *) die "unknown subcommand '$sub' (try: list mark unmark marked delete reap)";;
+  esac
+fi

@@ -2,6 +2,14 @@
 
 Useful scripts for Linux.
 
+## claude-session
+
+Manage [Claude Code](https://claude.com/claude-code) session transcripts: list them with titles,
+mark sessions for **per-session, opt-in** deletion, and reap the marked ones on the next launch (a
+live transcript is never deleted mid-write). Includes a SessionStart hook. Supports git-style short
+ids / prefixes and refuses to `delete` a session that's currently live. See
+[`claude-session/README.md`](claude-session/README.md) for dependencies, install, and design.
+
 ## link-picker
 
 Per-click browser/profile chooser for opening links. Registers as the default web browser, then prompts for browser (Brave/Firefox) and profile via `yad`.
