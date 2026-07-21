@@ -2,29 +2,30 @@
 # claude-session — manage Claude Code session transcripts.
 #
 # Sessions are stored as  ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
-# (plus an optional <uuid>/ sidecar dir). This tool lists them, marks the
-# current session for deletion, and reaps marked sessions on the NEXT launch
-# (so a live transcript is never deleted while it is still being written).
+# (plus an optional <uuid>/ sidecar dir). Deletion intent is recorded as a
+# marker file "<uuid>.jsonl.delete" next to the transcript — the SAME primitive
+# the dev-workspace SessionEnd cleanup uses. A marked transcript is removed when
+# its session next ends (SessionEnd hook) or, if the session isn't live, on the
+# next Claude Code launch (SessionStart reap) — never while it is still live.
 #
 # An <id> is a full session UUID or any unambiguous PREFIX of one — e.g. the
 # short id shown by `list` (the first block). An ambiguous prefix is rejected
 # and its candidates are listed, so nothing is deleted by guess.
 #
 # Subcommands:
-#   list [-l]            show sessions newest-first: short-id · title; [MARKED] = queued.
+#   list [-l]            show sessions newest-first: short-id · title; [MARKED] = marked.
 #                        -l / --long prints full UUIDs instead of short ids.
-#   mark   [<id>]        queue a session for deletion (default: $CLAUDE_SESSION_ID)
-#   unmark <id>          remove a session from the deletion queue
-#   marked               print the raw deletion queue
+#   mark   [<id>]        mark a session for deletion (default: the current session)
+#   unmark <id>          remove a session's deletion marker
+#   marked               list sessions currently marked for deletion
 #   delete [-f] <id>...  delete transcript(s) RIGHT NOW; refuses a LIVE session
 #                        (one a running Claude Code owns) unless -f/--force is given
-#   reap   [<current>]   delete every marked session except <current> (used by the hook)
+#   reap   [<current>]   delete every MARKED, non-live session (used by the SessionStart hook)
 #
-# Env overrides: CLAUDE_PROJECTS_DIR, CLAUDE_REAP_LIST, CLAUDE_SESSION_ID.
+# Env overrides: CLAUDE_PROJECTS_DIR, CLAUDE_SESSIONS_DIR, CLAUDE_SESSION_ID.
 set -euo pipefail
 
 PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
-REAP_LIST="${CLAUDE_REAP_LIST:-$HOME/.claude/reap-sessions}"
 
 die() { echo "claude-session: $*" >&2; exit 1; }
 
@@ -35,15 +36,17 @@ paths_for() {
   find "$PROJECTS_DIR" -maxdepth 2 \( -name "$id.jsonl" -o -name "$id" \) 2>/dev/null || true
 }
 
-# Read the queue into $1 (nameref), skipping blanks and # comments.
-read_queue() {
-  local -n _out="$1"; _out=()
-  [ -f "$REAP_LIST" ] || return 0
-  local line
-  while IFS= read -r line; do
-    case "$line" in ''|\#*) continue;; esac
-    _out+=("$line")
-  done < "$REAP_LIST"
+# The .jsonl transcript path for a session id ("" if none).
+transcript_for() {
+  [ -d "$PROJECTS_DIR" ] || return 0
+  find "$PROJECTS_DIR" -maxdepth 2 -name "$1.jsonl" 2>/dev/null | head -1
+}
+
+# Session ids that currently carry a .delete marker.
+marked_ids() {
+  [ -d "$PROJECTS_DIR" ] || return 0
+  find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl.delete' 2>/dev/null \
+    | sed -e 's#.*/##' -e 's/\.jsonl\.delete$//'
 }
 
 # Latest AI-generated title for a session transcript ("" if none / no jq).
@@ -105,8 +108,8 @@ live_ids() {
 cmd_list() {
   local long=0
   case "${1:-}" in -l|--long) long=1;; esac
-  local -a marked; read_queue marked
-  local id show sz mt flag rest f title
+  local marked_list; marked_list="$(marked_ids)"
+  local id show sz mt flag f title
   find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
     | sort -rn | while read -r _ f; do
       id="$(basename "$f" .jsonl)"
@@ -115,54 +118,48 @@ cmd_list() {
       mt="$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null)"
       title="$(title_for "$f")"
       flag=""
-      for rest in "${marked[@]:-}"; do [ "$rest" = "$id" ] && { flag="  [MARKED]"; break; }; done
+      if printf '%s\n' "$marked_list" | grep -qxF "$id"; then flag="  [MARKED]"; fi
       printf '%s  %5s  %-8s  %s%s\n' "$mt" "${sz:-?}" "$show" "${title:-(untitled)}" "$flag"
     done
 }
 
 cmd_marked() {
-  local -a marked; read_queue marked
-  [ "${#marked[@]}" -gt 0 ] || { echo "(deletion queue empty)"; return 0; }
-  printf '%s\n' "${marked[@]}"
+  local ids; ids="$(marked_ids | sort)"
+  [ -n "$ids" ] || { echo "(nothing marked for deletion)"; return 0; }
+  printf '%s\n' "$ids"
 }
 
 cmd_mark() {
-  local q="${1:-${CLAUDE_SESSION_ID:-}}"
-  [ -n "$q" ] || die "no session id given and CLAUDE_SESSION_ID not set"
+  local q="${1:-${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}}"
+  [ -n "$q" ] || die "no session id given and no current session in the environment"
   local id rc=0
-  if [[ "$q" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-    id="$q"                       # full uuid: accept as-is (covers the live session)
-  else
-    id="$(all_ids | _resolve "$q")" || rc=$?
-  fi
+  id="$(all_ids | _resolve "$q")" || rc=$?
   [ "$rc" = 2 ] && exit 1
   { [ "$rc" = 0 ] && [ -n "$id" ]; } || die "no session matches '$q'"
-  touch "$REAP_LIST"
-  if grep -qxF "$id" "$REAP_LIST" 2>/dev/null; then
-    echo "already queued: $id"
+  local t; t="$(transcript_for "$id")"
+  [ -n "$t" ] || die "no transcript file found for '$id'"
+  if [ -e "$t.delete" ]; then
+    echo "already marked: $id"
   else
-    printf '%s\n' "$id" >> "$REAP_LIST"
-    echo "queued for deletion (reaped on next Claude Code launch): $id"
+    : > "$t.delete"
+    echo "marked for deletion: $id"
+    echo "  removed when it next ends, or on next launch if it isn't live (never while live)."
   fi
 }
 
 cmd_unmark() {
   local q="${1:?usage: claude-session unmark <id>}"
-  [ -f "$REAP_LIST" ] || { echo "(queue empty)"; return 0; }
   local id rc=0
-  id="$(grep -vE '^[[:space:]]*($|#)' "$REAP_LIST" | _resolve "$q")" || rc=$?
+  id="$(marked_ids | _resolve "$q")" || rc=$?
   [ "$rc" = 2 ] && exit 1
-  { [ "$rc" = 0 ] && [ -n "$id" ]; } || die "no queued session matches '$q'"
-  _dequeue "$id"
-  echo "unqueued: $id"
-}
-
-# Remove one id from the queue file (no-op if absent).
-_dequeue() {
-  local id="$1"
-  [ -f "$REAP_LIST" ] || return 0
-  grep -vxF "$id" "$REAP_LIST" > "$REAP_LIST.tmp" 2>/dev/null || true
-  mv "$REAP_LIST.tmp" "$REAP_LIST"
+  { [ "$rc" = 0 ] && [ -n "$id" ]; } || die "no marked session matches '$q'"
+  local t; t="$(transcript_for "$id")"
+  if [ -n "$t" ]; then
+    rm -f -- "$t.delete"
+  else
+    find "$PROJECTS_DIR" -maxdepth 2 -name "$id.jsonl.delete" -delete 2>/dev/null || true
+  fi
+  echo "unmarked: $id"
 }
 
 cmd_delete() {
@@ -170,7 +167,7 @@ cmd_delete() {
   case "${1:-}" in -f|--force) force=1; shift;; esac
   [ "$#" -ge 1 ] || die "usage: claude-session delete [-f] <id> [id...]"
   local live; live="$(live_ids)"
-  local q id rc p found err=0
+  local q id rc p found t err=0
   for q in "$@"; do
     rc=0; id="$(all_ids | _resolve "$q")" || rc=$?
     [ "$rc" = 2 ] && { err=1; continue; }           # ambiguous — candidates already listed
@@ -180,32 +177,33 @@ cmd_delete() {
       echo "  use 'mark' to delete it safely on next launch, or 'delete -f' to force." >&2
       err=1; continue
     fi
+    t="$(transcript_for "$id")"
     found=0
     while IFS= read -r p; do
       [ -n "$p" ] || continue
       rm -rf -- "$p"; found=1
     done < <(paths_for "$id")
-    _dequeue "$id"
+    [ -n "$t" ] && rm -f -- "$t.delete"             # drop the marker too, if any
     if [ "$found" = 1 ]; then echo "deleted: $id"; else echo "not found: $id"; err=1; fi
   done
   return "$err"
 }
 
 cmd_reap() {
-  local current="${1:-${CLAUDE_SESSION_ID:-}}"
-  local -a marked; read_queue marked
-  [ "${#marked[@]}" -gt 0 ] || return 0
-  local -a kept=()
-  local id p found reaped=0
-  for id in "${marked[@]}"; do
-    if [ -n "$current" ] && [ "$id" = "$current" ]; then kept+=("$id"); continue; fi
-    found=0
-    while IFS= read -r p; do [ -n "$p" ] || continue; rm -rf -- "$p"; found=1; done < <(paths_for "$id")
+  local current="${1:-${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}}"
+  local live; live="$( { live_ids; if [ -n "$current" ]; then printf '%s\n' "$current"; fi; } | sort -u )"
+  local marker id t side reaped=0
+  while IFS= read -r marker; do
+    [ -n "$marker" ] || continue
+    id="$(basename "$marker" .jsonl.delete)"
+    if printf '%s\n' "$live" | grep -qxF "$id"; then continue; fi   # never touch a live session
+    t="${marker%.delete}"                                          # the .jsonl transcript
+    rm -f -- "$t" "$marker"
+    side="${t%.jsonl}"                                             # optional sidecar dir
+    if [ "$side" != "$t" ] && [ -d "$side" ]; then rm -rf -- "$side"; fi
     reaped=$((reaped+1))
-    [ "$found" = 1 ] && echo "claude-session: reaped $id" >&2
-  done
-  : > "$REAP_LIST"
-  [ "${#kept[@]}" -gt 0 ] && printf '%s\n' "${kept[@]}" >> "$REAP_LIST"
+    echo "claude-session: reaped $id" >&2
+  done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl.delete' 2>/dev/null)
   [ "$reaped" -gt 0 ] && echo "claude-session: reaped $reaped marked session(s)" >&2
   return 0
 }
