@@ -6,6 +6,8 @@
 #
 # Manual run:
 #   ./update-discord
+#   ./update-discord --check              # report only, notify on the desktop
+#   ./update-discord --check --no-notify  # report only, stay silent (used by update-all)
 #
 # Install as a daily routine (recommended: systemd timer):
 # 1) Install this script to a stable path and make it executable:
@@ -41,15 +43,18 @@ set -euo pipefail
 DOWNLOAD_URL="https://discord.com/api/download/stable?platform=linux&format=deb"
 TMP_DEB="/tmp/discord.deb"
 CHECK_ONLY=false
+NOTIFY=true
 
 for arg in "$@"; do
   case "$arg" in
-    --check) CHECK_ONLY=true ;;
+    --check)      CHECK_ONLY=true ;;
+    --no-notify)  NOTIFY=false ;;   # for callers that report/notify themselves (update-all)
   esac
 done
 
 send_notification() {
   local summary="$1" body="$2"
+  $NOTIFY || return 0
   if command -v notify-send >/dev/null 2>&1; then
     DISPLAY="${DISPLAY:-:0}" \
     DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \

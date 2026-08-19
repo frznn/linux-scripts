@@ -13,8 +13,11 @@ ids / prefixes and refuses to `delete` a session that's currently live. See
 ## update-all
 
 One report for every update source on this box — **APT**, **Flatpak** (user *and* system scope),
-**global npm** packages, and the standalone **AI CLIs** (`claude` / `codex` / `grok`) that no package
-manager tracks. Checking is read-only and needs no privileges; applying is always explicit.
+**global npm** packages, **hand-installed `.deb`s** that apt structurally cannot see, and the
+standalone **AI CLIs** (`claude` / `codex` / `grok`) that no package manager tracks. Checking is
+read-only and needs no privileges; applying is always explicit.
+
+Sources: `apt` · `flatpak` · `npm` · `deb` · `ai`
 
 ```bash
 update-all                       # check everything (default)
@@ -59,11 +62,33 @@ WantedBy=timers.target
 systemctl --user daemon-reload && systemctl --user enable --now update-all.timer
 ```
 
+### The `deb` source
+
+Packages installed from a downloaded `.deb` with no repo behind them (here: Discord, Proton Mail)
+are invisible to `apt list --upgradable` forever — `apt-cache policy` shows the candidate equal to
+what is installed. Each needs its own upstream version oracle: Discord delegates to
+`update-discord --check --no-notify` (one place for that logic), Proton Mail reads upstream's
+`version.json`. Applying verifies Proton's published SHA512 before `dpkg -i` — which guards a
+truncated download, not a compromised feed, since URL and checksum come from the same place.
+
+Find new members of that class with:
+
+```bash
+comm -23 <(dpkg-query -W -f='${Package}\n' | sort) \
+         <(apt-cache dumpavail | awk '/^Package: /{print $2}' | sort -u)
+```
+
 ### Note for nvm users
 
 npm is resolved via `~/.nvm/alias/default` and its own `bin/` is prepended to `PATH`. Without that,
 a systemd unit's bare `PATH` picks the distro `npm`/`node` and the check reports "up to date" with
 an empty `/usr` prefix — a silent false negative.
+
+## update-discord
+
+Keeps Discord current: it is installed from a downloaded `.deb` with no apt repo, so nothing else
+will ever offer an update. `--check` reports without installing; `--no-notify` additionally
+suppresses the desktop notification, for callers that report for themselves (`update-all`).
 
 ## link-picker
 
