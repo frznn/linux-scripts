@@ -26,8 +26,13 @@ Full pass to update the repo for the current box (Pop!_OS 24.04, COSMIC, flatpak
       misses some base packages (`adduser`/`apt`/`apt-utils` still show up).
 
 ### Docs
-- [ ] README covers only `link-picker`; document the useful utils (`ps-cpu`, `ps-ram`, `list-installed`).
+- [ ] README covers `link-picker` + `update-all`; still document the utils (`ps-cpu`, `ps-ram`,
+      `list-installed`).
 - [ ] Fold the newer `utils/usb-mount-prompt` tool into the same review.
+
+### Done (2026-08-19)
+- [x] Added `update-all` — cross-manager update checker/applier (apt · flatpak · npm globals · AI
+      CLIs) with a daily `--user` systemd timer + notification. Documented in the README.
 
 ### Done (2026-07-13)
 - [x] Fixed `link-picker` Firefox path (`/snap/bin/firefox` → `/usr/bin/firefox`).

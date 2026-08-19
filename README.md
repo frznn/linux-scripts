@@ -10,6 +10,61 @@ live transcript is never deleted mid-write). Includes a SessionStart hook. Suppo
 ids / prefixes and refuses to `delete` a session that's currently live. See
 [`claude-session/README.md`](claude-session/README.md) for dependencies, install, and design.
 
+## update-all
+
+One report for every update source on this box — **APT**, **Flatpak** (user *and* system scope),
+**global npm** packages, and the standalone **AI CLIs** (`claude` / `codex` / `grok`) that no package
+manager tracks. Checking is read-only and needs no privileges; applying is always explicit.
+
+```bash
+update-all                       # check everything (default)
+update-all --apply               # apply everything
+update-all --apply flatpak npm   # only these sources
+update-all --notify --only-new   # desktop notification when something is pending
+update-all --full                # don't truncate long lists
+```
+
+Exit codes: `0` up to date · `10` updates pending (check mode) · `1` an apply failed.
+
+### Install
+
+```bash
+ln -sfn "$PWD/update-all" ~/.local/bin/update-all
+```
+
+For a daily check + notification, a **user** systemd timer (no root — the check path is unprivileged):
+
+```ini
+# ~/.config/systemd/user/update-all.service
+[Unit]
+Description=Check for pending updates (apt, flatpak, npm, AI CLIs) and notify
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/update-all --notify
+SuccessExitStatus=0 10          # exit 10 = "updates pending", not a failure
+```
+```ini
+# ~/.config/systemd/user/update-all.timer
+[Unit]
+Description=Daily update check
+[Timer]
+OnCalendar=*-*-* 10:00:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=update-all.service
+[Install]
+WantedBy=timers.target
+```
+```bash
+systemctl --user daemon-reload && systemctl --user enable --now update-all.timer
+```
+
+### Note for nvm users
+
+npm is resolved via `~/.nvm/alias/default` and its own `bin/` is prepended to `PATH`. Without that,
+a systemd unit's bare `PATH` picks the distro `npm`/`node` and the check reports "up to date" with
+an empty `/usr` prefix — a silent false negative.
+
 ## link-picker
 
 Per-click browser/profile chooser for opening links. Registers as the default web browser, then prompts for browser (Brave/Firefox) and profile via `yad`.

@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# update-all
+#
+# One place to see — and apply — pending updates across every package manager
+# on this box: APT, Flatpak (user + system), global npm packages, and the
+# standalone AI CLIs (claude / codex / grok) that live outside any manager.
+#
+# USAGE
+#   update-all                     # check everything, print a report (default)
+#   update-all --apply             # check, then apply everything
+#   update-all --apply flatpak npm # apply only these sources
+#   update-all --notify            # check + desktop notification if anything is pending
+#   update-all --full              # don't truncate long package lists
+#   update-all --only-new          # with --notify: notify only if the pending set changed
+#
+#   Sources: apt  flatpak  npm  ai   (default: all)
+#
+# EXIT CODES
+#   0  nothing pending (check mode) / all applied (apply mode)
+#   10 updates are available (check mode only — useful for scripting)
+#   1  a check or an apply failed
+#
+# NOTES
+#   * Check mode is READ-ONLY and needs no privileges. Unlike `update-discord`,
+#     the default is check, not apply — applying is always explicit (--apply).
+#   * APT reads the package lists as-is; `apt-daily.timer` refreshes them ~daily.
+#     Applying runs `sudo apt update` first, so an apply is never stale.
+#   * Applying APT needs sudo (password prompt); applying system-scope flatpaks
+#     needs a polkit prompt. Run it from a terminal, not from the timer.
+#
+# INSTALL AS A DAILY CHECK (user systemd timer — no root needed):
+#   see update-all.timer / update-all.service in ~/.config/systemd/user/
+#   systemctl --user enable --now update-all.timer
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+
+MODE=check
+NOTIFY=false
+FULL=false
+ONLY_NEW=false
+SOURCES=()
+MAXLIST=10
+NET_TIMEOUT=90
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/update-all"
+
+# ── args ─────────────────────────────────────────────────────────────────────
+for arg in "$@"; do
+  case "$arg" in
+    --apply|--update)  MODE=apply ;;
+    --check)           MODE=check ;;
+    --notify)          NOTIFY=true ;;
+    --full)            FULL=true ;;
+    --only-new)        ONLY_NEW=true ;;
+    -h|--help)         sed -n '2,40p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    apt|flatpak|npm|ai) SOURCES+=("$arg") ;;
+    *) echo "update-all: unknown argument '$arg' (try --help)" >&2; exit 1 ;;
+  esac
+done
+(( ${#SOURCES[@]} )) || SOURCES=(apt flatpak npm ai)
+
+wants() { local s; for s in "${SOURCES[@]}"; do [[ "$s" == "$1" ]] && return 0; done; return 1; }
+
+# ── output helpers (same house style as list-installed) ──────────────────────
+section() { printf "\n\033[1m━━━ %s ━━━\033[0m\n\n" "$1"; }
+item()    { printf "  %-38s %s\n" "$1" "$2"; }
+note()    { printf "  \033[2m%s\033[0m\n" "$1"; }
+ok()      { printf "  \033[32m✓\033[0m %s\n" "$1"; }
+warn()    { printf "  \033[33m!\033[0m %s\n" "$1"; }
+
+# join <sep> <items...>
+join_list() { local sep="$1"; shift; local out=""; local i; for i in "$@"; do out+="${out:+$sep}$i"; done; printf '%s' "$out"; }
+
+TOTAL=0
+SUMMARY=()
+FAILED=false
+
+# Print at most $MAXLIST lines from stdin unless --full.
+truncate_list() {
+  local n=0 line extra=0
+  while IFS= read -r line; do
+    if $FULL || (( n < MAXLIST )); then printf '    %s\n' "$line"; else extra=$(( extra + 1 )); fi
+    n=$(( n + 1 ))
+  done
+  (( extra > 0 )) && note "    … +$extra more (run with --full)"
+  return 0
+}
+
+# newer <have> <candidate> → true when candidate is strictly newer
+newer() {
+  [[ "$1" == "$2" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$2" ]]
+}
+
+send_notification() {
+  local summary="$1" body="$2"
+  command -v notify-send >/dev/null 2>&1 || return 0
+  DISPLAY="${DISPLAY:-:0}" \
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
+  notify-send -a "update-all" -i software-update-available "$summary" "$body" || true
+}
+
+# npm / AI CLIs are not on PATH under systemd --user → resolve them explicitly.
+find_npm() {
+  # Prefer the nvm-managed npm — that's where the global packages live. A distro
+  # npm (/usr/bin/npm, 9.2.0) sits on the default PATH and would report an empty
+  # /usr/local prefix, which is exactly what a systemd timer would otherwise pick.
+  local nvm_root="${NVM_DIR:-$HOME/.nvm}" want n
+  want=$(cat "$nvm_root/alias/default" 2>/dev/null)
+  if [[ -n "$want" ]]; then
+    n=$(ls -d "$nvm_root"/versions/node/v"${want#v}"*/bin/npm 2>/dev/null | sort -V | tail -n1)
+    [[ -x "$n" ]] && { echo "$n"; return 0; }
+  fi
+  n=$(ls -d "$nvm_root"/versions/node/*/bin/npm 2>/dev/null | sort -V | tail -n1)
+  [[ -x "$n" ]] && { echo "$n"; return 0; }
+  command -v npm 2>/dev/null
+}
+NPM="$(find_npm || true)"
+# npm is a JS shim with `#!/usr/bin/env node`, so it runs on whatever node PATH
+# resolves first. Without this, the nvm npm executes under the distro node and
+# reports that node's global prefix (/usr) with none of the real packages.
+[[ -n "$NPM" ]] && PATH="$(dirname "$NPM"):$PATH"
+
+find_bin() {
+  command -v "$1" 2>/dev/null && return 0
+  for p in "$HOME/.local/bin/$1" "$HOME/.grok/bin/$1"; do [[ -x "$p" ]] && { echo "$p"; return 0; }; done
+  return 1
+}
+
+# ── APT ──────────────────────────────────────────────────────────────────────
+check_apt() {
+  section "APT"
+  local stamp age
+  stamp=$(stat -c %Y /var/lib/apt/lists 2>/dev/null || echo 0)
+  age=$(( ( $(date +%s) - stamp ) / 3600 ))
+  local list count
+  list=$(apt list --upgradable 2>/dev/null | tail -n +2 \
+         | sed -E 's|^([^/]+)/\S+ (\S+) \S+ \[upgradable from: ([^]]+)\]|\1  \3 → \2|')
+  count=$(printf '%s' "$list" | grep -c . )
+  if (( count == 0 )); then
+    ok "up to date"
+  else
+    printf "  %s package(s) upgradable\n" "$count"
+    printf '%s\n' "$list" | truncate_list
+    TOTAL=$(( TOTAL + count )); SUMMARY+=("apt: $count")
+  fi
+  note "package lists last refreshed ${age}h ago (apt-daily.timer)"
+}
+
+apply_apt() {
+  section "APT — applying"
+  sudo apt-get update -q && sudo apt-get full-upgrade -y || { warn "apt failed"; FAILED=true; return 1; }
+  ok "apt done"
+  note "run 'sudo apt autoremove' separately if you want orphans purged"
+}
+
+# ── Flatpak ──────────────────────────────────────────────────────────────────
+check_flatpak() {
+  section "Flatpak"
+  local scope list count total=0
+  for scope in user system; do
+    list=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --app --"$scope" \
+             --columns=name,application,version 2>/dev/null | sed -E 's/\t/  /g')
+    count=$(printf '%s' "$list" | grep -c . )
+    if (( count > 0 )); then
+      printf "  %s: %s app(s)\n" "$scope" "$count"
+      printf '%s\n' "$list" | truncate_list
+      total=$(( total + count ))
+    fi
+  done
+  # runtimes/extensions, counted but not listed
+  local rt
+  rt=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --runtime 2>/dev/null | grep -c . )
+  (( rt > 0 )) && note "plus $rt runtime/extension update(s)"
+  if (( total == 0 && rt == 0 )); then ok "up to date"; else
+    TOTAL=$(( TOTAL + total + rt )); SUMMARY+=("flatpak: $(( total + rt ))")
+  fi
+}
+
+apply_flatpak() {
+  section "Flatpak — applying"
+  flatpak update -y --user   || { warn "flatpak --user failed"; FAILED=true; }
+  flatpak update -y --system || { warn "flatpak --system failed (polkit auth?)"; FAILED=true; }
+  ok "flatpak done"
+  note "unused runtimes can be reclaimed with: flatpak uninstall --unused"
+}
+
+# ── npm globals ──────────────────────────────────────────────────────────────
+# Only counts packages whose *latest* is strictly newer than what's installed —
+# `npm outdated` also flags packages sitting ahead of the registry (pre-releases).
+npm_pending() {
+  [[ -n "$NPM" ]] || return 0
+  local node="${NPM%/npm}/node"
+  [[ -x "$node" ]] || node=$(command -v node 2>/dev/null)
+  local json
+  json=$(timeout "$NET_TIMEOUT" "$NPM" outdated -g --depth=0 --json 2>/dev/null)
+  [[ -z "$json" || "$json" == "{}" ]] && return 0
+  if [[ -x "$node" ]]; then
+    # npm pretty-prints the JSON, so parse it properly rather than by line.
+    printf '%s' "$json" | "$node" -e '
+      let raw=""; process.stdin.on("data",d=>raw+=d).on("end",()=>{
+        let o={}; try { o=JSON.parse(raw) } catch(e) { process.exit(0) }
+        for (const [name,v] of Object.entries(o))
+          if (v.current && v.latest) console.log(`${name}\t${v.current}\t${v.latest}`)
+      })' | while IFS=$'\t' read -r name cur lat; do
+        newer "$cur" "$lat" && printf '%s  %s → %s\n' "$name" "$cur" "$lat"
+      done
+  else
+    warn "node not found — cannot parse npm output" >&2
+  fi
+}
+
+check_npm() {
+  section "npm (global)"
+  if [[ -z "$NPM" ]]; then warn "npm not found"; return 0; fi
+  local list count
+  list=$(npm_pending); count=$(printf '%s' "$list" | grep -c . )
+  if (( count == 0 )); then ok "up to date"; else
+    printf "  %s global package(s)\n" "$count"
+    printf '%s\n' "$list" | truncate_list
+    TOTAL=$(( TOTAL + count )); SUMMARY+=("npm: $count")
+  fi
+  note "prefix: $("$NPM" config get prefix 2>/dev/null) · ignore-scripts=$("$NPM" config get ignore-scripts 2>/dev/null)"
+}
+
+apply_npm() {
+  section "npm (global) — applying"
+  [[ -n "$NPM" ]] || { warn "npm not found"; return 0; }
+  local pkg
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    pkg=${line%% *}
+    echo "  → $pkg"
+    "$NPM" install -g "$pkg@latest" >/dev/null || { warn "$pkg failed"; FAILED=true; }
+  done < <(npm_pending)
+  ok "npm done  (install scripts stayed disabled — global policy)"
+}
+
+# ── AI CLIs (standalone binaries, self-updating) ─────────────────────────────
+ai_pending() {
+  local bin have want
+  # claude — native install; the npm registry is the version oracle
+  if bin=$(find_bin claude); then
+    have=$("$bin" --version 2>/dev/null | grep -oE '^[0-9.]+')
+    want=$(timeout "$NET_TIMEOUT" "${NPM:-npm}" view @anthropic-ai/claude-code version 2>/dev/null | tr -d '[:space:]')
+    [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" && printf 'claude  %s → %s\n' "$have" "$want"
+  fi
+  # codex — same trick against its npm wrapper package
+  if bin=$(find_bin codex); then
+    have=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    want=$(timeout "$NET_TIMEOUT" "${NPM:-npm}" view @openai/codex version 2>/dev/null | tr -d '[:space:]')
+    [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" && printf 'codex  %s → %s\n' "$have" "$want"
+  fi
+  # grok — has a first-class check
+  if bin=$(find_bin grok); then
+    local json
+    json=$(timeout "$NET_TIMEOUT" "$bin" update --check --json 2>/dev/null)
+    if [[ "$json" == *'"updateAvailable":true'* ]]; then
+      have=$(sed -nE 's/.*"currentVersion":"([^"]+)".*/\1/p' <<<"$json")
+      want=$(sed -nE 's/.*"latestVersion":"([^"]+)".*/\1/p' <<<"$json")
+      printf 'grok  %s → %s\n' "$have" "$want"
+    fi
+  fi
+}
+
+check_ai() {
+  section "AI CLIs"
+  local list count
+  list=$(ai_pending); count=$(printf '%s' "$list" | grep -c . )
+  if (( count == 0 )); then ok "up to date"; else
+    printf "  %s CLI(s)\n" "$count"
+    printf '%s\n' "$list" | truncate_list
+    TOTAL=$(( TOTAL + count )); SUMMARY+=("ai: $count")
+  fi
+}
+
+apply_ai() {
+  section "AI CLIs — applying"
+  local name bin
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    name=${line%% *}
+    bin=$(find_bin "$name") || continue
+    echo "  → $name"
+    "$bin" update || { warn "$name update failed"; FAILED=true; }
+  done < <(ai_pending)
+  ok "AI CLIs done"
+}
+
+# ── run ──────────────────────────────────────────────────────────────────────
+printf "\033[1mupdate-all\033[0m — %s · %s\n" "$MODE" "$(date '+%Y-%m-%d %H:%M')"
+
+for s in apt flatpak npm ai; do wants "$s" && "check_$s"; done
+
+echo
+if (( TOTAL == 0 )); then
+  printf "\033[1;32mEverything is up to date.\033[0m\n"
+else
+  printf "\033[1;33m%d update(s) pending\033[0m — %s\n" "$TOTAL" "$(join_list ', ' "${SUMMARY[@]}")"
+fi
+
+if $NOTIFY && (( TOTAL > 0 )); then
+  mkdir -p "$CACHE_DIR"
+  fingerprint=$(printf '%s' "${SUMMARY[*]}" | md5sum | cut -d' ' -f1)
+  if ! $ONLY_NEW || [[ "$fingerprint" != "$(cat "$CACHE_DIR/last" 2>/dev/null)" ]]; then
+    send_notification "$TOTAL update(s) available" "$(join_list $'\n' "${SUMMARY[@]}")
+Run: update-all --apply"
+  fi
+  printf '%s' "$fingerprint" > "$CACHE_DIR/last"
+fi
+
+if [[ "$MODE" == apply ]]; then
+  (( TOTAL == 0 )) && exit 0
+  for s in apt flatpak npm ai; do wants "$s" && "apply_$s"; done
+  echo
+  $FAILED && { printf "\033[1;31mSome updates failed — see above.\033[0m\n"; exit 1; }
+  printf "\033[1;32mAll requested updates applied.\033[0m\n"
+  exit 0
+fi
+
+(( TOTAL > 0 )) && exit 10
+exit 0
