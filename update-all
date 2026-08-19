@@ -196,27 +196,42 @@ apply_flatpak() {
 # corepack@0.35.0, which installs with only a warning and is then unsupported.
 # So resolve, per package, the newest published version whose engines.node this
 # node actually satisfies — using the semver that npm itself ships.
-npm_best_version() {  # <pkg> → "best<TAB>latest<TAB>latest_engine"
-  local pkg="$1" semver_dir url
+npm_best_version() {  # <pkg> <current> → "target<TAB>reason"
+  local pkg="$1" cur="$2" semver_dir url
   semver_dir="$("$NPM" root -g 2>/dev/null)/npm/node_modules/semver"
   [[ -d "$semver_dir" && -x "$NODE" ]] || return 1
   url="https://registry.npmjs.org/${pkg//\//%2f}"
   timeout "$NET_TIMEOUT" curl -fsSL "$url" 2>/dev/null | "$NODE" -e '
     const semver = require(process.argv[1]);
+    const cur = process.argv[2];
     let raw = ""; process.stdin.on("data", d => raw += d).on("end", () => {
       let p; try { p = JSON.parse(raw) } catch (e) { process.exit(1) }
       const versions = p.versions || {};
       const latest = (p["dist-tags"] || {}).latest || null;
+      const fits = v => {
+        const eng = ((versions[v] || {}).engines || {}).node;
+        return !eng || semver.satisfies(process.versions.node, eng);
+      };
+      // Prefer the latest dist-tag — that is the channel the publisher points at.
+      if (latest && fits(latest) && semver.gt(latest, cur)) return console.log(latest + "\t");
+      // Otherwise take the newest version this node can actually run. Two cases
+      // land here: latest needs a newer node, or the installed version is already
+      // past the latest tag (an off-tag/preview line the user opted into).
       let best = null;
       for (const [v, m] of Object.entries(versions)) {
-        if (semver.prerelease(v) || m.deprecated) continue;
-        const eng = (m.engines || {}).node;
-        if (eng && !semver.satisfies(process.versions.node, eng)) continue;
+        if (semver.prerelease(v) || m.deprecated || !fits(v)) continue;
         if (!best || semver.gt(v, best)) best = v;
       }
-      const latestEngine = latest && (versions[latest].engines || {}).node || "";
-      console.log([best || "", latest || "", latestEngine].join("\t"));
-    })' "$semver_dir"
+      if (!best) return console.log("\t");
+      let reason = "";
+      if (latest && !fits(latest)) {
+        const eng = (versions[latest].engines || {}).node || "?";
+        reason = `latest ${latest} needs node ${eng}`;
+      } else if (latest && semver.gt(best, latest)) {
+        reason = `ahead of the ${latest} latest tag — staying on that line`;
+      }
+      console.log(best + "\t" + reason);
+    })' "$semver_dir" "$cur"
 }
 
 npm_pending() {
@@ -230,14 +245,14 @@ npm_pending() {
       for (const [name,v] of Object.entries(o))
         if (v.current) console.log(`${name}\t${v.current}`)
     })' | while IFS=$'\t' read -r name cur; do
-      local best latest eng
-      IFS=$'\t' read -r best latest eng < <(npm_best_version "$name")
-      [[ -z "$best" ]] && continue
-      newer "$cur" "$best" || continue
-      if [[ "$best" != "$latest" && -n "$latest" ]]; then
-        printf '%s  %s → %s   (latest %s needs node %s)\n' "$name" "$cur" "$best" "$latest" "${eng:-?}"
+      local target reason
+      IFS=$'\t' read -r target reason < <(npm_best_version "$name" "$cur")
+      [[ -z "$target" ]] && continue
+      newer "$cur" "$target" || continue
+      if [[ -n "$reason" ]]; then
+        printf '%s  %s → %s   (%s)\n' "$name" "$cur" "$target" "$reason"
       else
-        printf '%s  %s → %s\n' "$name" "$cur" "$best"
+        printf '%s  %s → %s\n' "$name" "$cur" "$target"
       fi
     done
 }
