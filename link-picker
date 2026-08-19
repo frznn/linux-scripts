@@ -2,22 +2,58 @@
 set -euo pipefail
 
 URL_ARGS=("$@")
+
+# --- single-click de-duplication (added 2026-08-19) --------------------------
+# One click can reach this script TWICE: cosmic-term opens the link itself and
+# a TUI app with mouse reporting (e.g. Claude Code) also opens it, ~0.6s apart.
+# The terminal scrapes the rendered screen, so its URL can be a truncated
+# prefix of the real one. Collapse prefix-related pairs into a single picker
+# and keep the longest (complete) URL. Unrelated URLs are never collapsed, so
+# two different links clicked in quick succession still get two pickers.
+LP_STATE="${XDG_RUNTIME_DIR:-/tmp}/link-picker"
+LP_DEDUPE=0
+if [ $# -eq 1 ]; then
+  LP_DEDUPE=1
+  mkdir -p "$LP_STATE"
+  chmod 700 "$LP_STATE"
+  exec 9>"$LP_STATE/lock"
+  flock 9
+  lp_now=$(date +%s%N)
+  lp_pid=""; lp_ts=0; lp_url=""
+  if [ -r "$LP_STATE/current" ]; then
+    read -r lp_pid lp_ts lp_url < "$LP_STATE/current" || true
+  fi
+  if [ -n "$lp_pid" ] && kill -0 "$lp_pid" 2>/dev/null \
+     && [ "$(( (lp_now - lp_ts) / 1000000000 ))" -lt 2 ] \
+     && [ -n "$lp_url" ] \
+     && { [ "${1#"$lp_url"}" != "$1" ] || [ "${lp_url#"$1"}" != "$lp_url" ]; }; then
+    # Same click as the live picker: hand over the better URL, show no window.
+    if [ ${#1} -gt ${#lp_url} ]; then
+      printf '%s %s %s\n' "$lp_pid" "$lp_ts" "$1" > "$LP_STATE/current"
+    fi
+    exit 0
+  fi
+  printf '%s %s %s\n' "$$" "$lp_now" "$1" > "$LP_STATE/current"
+  flock -u 9
+fi
 BRAVE_BIN="/usr/bin/brave-browser"
 BRAVE_LOCAL_STATE="$HOME/.config/BraveSoftware/Brave-Browser/Local State"
 FIREFOX_BIN="/usr/bin/firefox"
 FIREFOX_PROFILES_INI="$HOME/.mozilla/firefox/profiles.ini"
 
 # Geometry "WxH+X+Y" centered on the primary monitor (or first connected if no primary).
+# NB: uses bash regex, not awk's 3-arg match() -- that is a gawk extension and
+# /usr/bin/awk here is mawk, which fails to parse it (so this silently returned
+# nothing and every window was left unpositioned). Fixed 2026-08-19.
 geom() {
-  local w=$1 h=$2
-  xrandr --query 2>/dev/null | awk -v w="$w" -v h="$h" '
-    /^[A-Za-z0-9_-]+ connected primary/ { primary=$0 }
-    /^[A-Za-z0-9_-]+ connected/ && !first { first=$0 }
-    END {
-      line = (primary != "") ? primary : first
-      if (match(line, /([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)/, m))
-        printf "%dx%d+%d+%d", w, h, m[3]+(m[1]-w)/2, m[4]+(m[2]-h)/2
-    }'
+  local w=$1 h=$2 line
+  line=$(xrandr --query 2>/dev/null | grep -m1 -E '^[A-Za-z0-9_-]+ connected primary') ||
+    line=$(xrandr --query 2>/dev/null | grep -m1 -E '^[A-Za-z0-9_-]+ connected') ||
+    return 0
+  [[ $line =~ ([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+) ]] || return 0
+  printf '%dx%d+%d+%d' "$w" "$h" \
+    $(( BASH_REMATCH[3] + (BASH_REMATCH[1] - w) / 2 )) \
+    $(( BASH_REMATCH[4] + (BASH_REMATCH[2] - h) / 2 ))
 }
 
 pick_brave_profile() {
@@ -57,6 +93,15 @@ browser=$(yad --list \
   --separator="" --no-headers \
   --geometry="$(geom 280 230)" \
   "Brave" "Firefox" 2>/dev/null) || exit 0
+
+# A later duplicate invocation may have supplied the complete URL.
+if [ "$LP_DEDUPE" -eq 1 ] && [ -r "$LP_STATE/current" ]; then
+  lp_own=""; lp_best=""
+  read -r lp_own _ lp_best < "$LP_STATE/current" || true
+  if [ "$lp_own" = "$$" ] && [ -n "$lp_best" ]; then
+    URL_ARGS=("$lp_best")
+  fi
+fi
 
 case "$browser" in
   Brave)
