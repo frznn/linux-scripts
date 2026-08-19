@@ -2,33 +2,34 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # update-all
 #
-# One place to see — and apply — pending updates across every package manager
-# on this box: APT, Flatpak (user + system), global npm packages, hand-installed
-# .debs that apt structurally cannot see, and the standalone AI CLIs
-# (claude / codex / grok) that live outside any manager.
+# One place to see — and then choose to apply — pending updates across every
+# package manager on this box: APT, Flatpak (user + system), global npm
+# packages, hand-installed .debs that apt structurally cannot see, and the
+# standalone AI CLIs (claude / codex / grok) that live outside any manager.
 #
 # USAGE
-#   update-all                     # check everything, print a report (default)
-#   update-all --apply             # check, then apply everything
-#   update-all --apply flatpak npm # apply only these sources
-#   update-all --notify            # check + desktop notification if anything is pending
-#   update-all --full              # don't truncate long package lists
-#   update-all --only-new          # with --notify: notify only if the pending set changed
+#   update-all                  # check everything, show how to apply, then prompt
+#   update-all npm deb          # only these sources (still prompts)
+#   update-all --notify         # check + desktop notification; never prompts
+#   update-all --full           # don't truncate long package lists
+#   update-all --only-new       # with --notify: notify only if the pending set changed
 #
 #   Sources: apt  flatpak  npm  deb  ai   (default: all)
 #
+# The check is READ-ONLY and needs no privileges. Applying only ever happens
+# after an explicit answer at the prompt — and the prompt appears only on a
+# terminal, so an unattended run (the timer) reports and stops.
+#
 # EXIT CODES
-#   0  nothing pending (check mode) / all applied (apply mode)
-#   10 updates are available (check mode only — useful for scripting)
-#   1  a check or an apply failed
+#   0  nothing pending, or everything applied
+#   10 updates are available and were not applied
+#   1  an apply failed
 #
 # NOTES
-#   * Check mode is READ-ONLY and needs no privileges. Unlike `update-discord`,
-#     the default is check, not apply — applying is always explicit (--apply).
 #   * APT reads the package lists as-is; `apt-daily.timer` refreshes them ~daily.
-#     Applying runs `sudo apt update` first, so an apply is never stale.
-#   * Applying APT needs sudo (password prompt); applying system-scope flatpaks
-#     needs a polkit prompt. Run it from a terminal, not from the timer.
+#     Applying runs `sudo apt-get update` first, so an apply is never stale.
+#   * npm targets are ENGINE-AWARE: the newest version whose engines.node your
+#     node actually satisfies, not blindly @latest (node 20 cannot run npm 12).
 #
 # INSTALL AS A DAILY CHECK (user systemd timer — no root needed):
 #   see update-all.timer / update-all.service in ~/.config/systemd/user/
@@ -36,7 +37,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-MODE=check
 NOTIFY=false
 FULL=false
 ONLY_NEW=false
@@ -48,15 +48,12 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/update-all"
 # repo (update-discord) are found no matter how update-all was invoked.
 SELF_DIR="$(dirname "$(readlink -f "$0")")"
 
-# ── args ─────────────────────────────────────────────────────────────────────
 for arg in "$@"; do
   case "$arg" in
-    --apply|--update)  MODE=apply ;;
-    --check)           MODE=check ;;
     --notify)          NOTIFY=true ;;
     --full)            FULL=true ;;
     --only-new)        ONLY_NEW=true ;;
-    -h|--help)         sed -n '2,40p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)         sed -n '2,45p' "$0" | sed 's/^# \?//'; exit 0 ;;
     apt|flatpak|npm|deb|ai) SOURCES+=("$arg") ;;
     *) echo "update-all: unknown argument '$arg' (try --help)" >&2; exit 1 ;;
   esac
@@ -67,19 +64,17 @@ wants() { local s; for s in "${SOURCES[@]}"; do [[ "$s" == "$1" ]] && return 0; 
 
 # ── output helpers (same house style as list-installed) ──────────────────────
 section() { printf "\n\033[1m━━━ %s ━━━\033[0m\n\n" "$1"; }
-item()    { printf "  %-38s %s\n" "$1" "$2"; }
 note()    { printf "  \033[2m%s\033[0m\n" "$1"; }
 ok()      { printf "  \033[32m✓\033[0m %s\n" "$1"; }
 warn()    { printf "  \033[33m!\033[0m %s\n" "$1"; }
+join_list() { local sep="$1"; shift; local out="" i; for i in "$@"; do out+="${out:+$sep}$i"; done; printf '%s' "$out"; }
 
-# join <sep> <items...>
-join_list() { local sep="$1"; shift; local out=""; local i; for i in "$@"; do out+="${out:+$sep}$i"; done; printf '%s' "$out"; }
-
+declare -A COUNT=()      # source → number pending
+declare -A PENDING=()    # source → "name  old → new" lines (computed once, reused by apply)
+declare -A HOWTO=()      # source → the command to apply that source by hand
 TOTAL=0
-SUMMARY=()
 FAILED=false
 
-# Print at most $MAXLIST lines from stdin unless --full.
 truncate_list() {
   local n=0 line extra=0
   while IFS= read -r line; do
@@ -90,7 +85,18 @@ truncate_list() {
   return 0
 }
 
-# newer <have> <candidate> → true when candidate is strictly newer
+report() {  # report <source> <label> — print the cached pending list and count it
+  local src="$1" label="$2" list count
+  list="${PENDING[$src]:-}"
+  count=$(printf '%s' "$list" | grep -c . )
+  COUNT[$src]=$count
+  if (( count == 0 )); then ok "up to date"; else
+    printf "  %s %s\n" "$count" "$label"
+    printf '%s\n' "$list" | truncate_list
+    TOTAL=$(( TOTAL + count ))
+  fi
+}
+
 newer() {
   [[ "$1" == "$2" ]] && return 1
   [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$2" ]]
@@ -104,7 +110,6 @@ send_notification() {
   notify-send -a "update-all" -i software-update-available "$summary" "$body" || true
 }
 
-# npm / AI CLIs are not on PATH under systemd --user → resolve them explicitly.
 find_npm() {
   # Prefer the nvm-managed npm — that's where the global packages live. A distro
   # npm (/usr/bin/npm, 9.2.0) sits on the default PATH and would report an empty
@@ -124,9 +129,11 @@ NPM="$(find_npm || true)"
 # resolves first. Without this, the nvm npm executes under the distro node and
 # reports that node's global prefix (/usr) with none of the real packages.
 [[ -n "$NPM" ]] && PATH="$(dirname "$NPM"):$PATH"
+NODE="${NPM%/npm}/node"; [[ -x "$NODE" ]] || NODE="$(command -v node 2>/dev/null)"
 
 find_bin() {
   command -v "$1" 2>/dev/null && return 0
+  local p
   for p in "$HOME/.local/bin/$1" "$HOME/.grok/bin/$1"; do [[ -x "$p" ]] && { echo "$p"; return 0; }; done
   return 1
 }
@@ -134,110 +141,164 @@ find_bin() {
 # ── APT ──────────────────────────────────────────────────────────────────────
 check_apt() {
   section "APT"
+  HOWTO[apt]='sudo apt update && sudo apt full-upgrade'
   local stamp age
   stamp=$(stat -c %Y /var/lib/apt/lists 2>/dev/null || echo 0)
   age=$(( ( $(date +%s) - stamp ) / 3600 ))
-  local list count
-  list=$(apt list --upgradable 2>/dev/null | tail -n +2 \
+  PENDING[apt]=$(apt list --upgradable 2>/dev/null | tail -n +2 \
          | sed -E 's|^([^/]+)/\S+ (\S+) \S+ \[upgradable from: ([^]]+)\]|\1  \3 → \2|')
-  count=$(printf '%s' "$list" | grep -c . )
-  if (( count == 0 )); then
-    ok "up to date"
-  else
-    printf "  %s package(s) upgradable\n" "$count"
-    printf '%s\n' "$list" | truncate_list
-    TOTAL=$(( TOTAL + count )); SUMMARY+=("apt: $count")
-  fi
+  report apt "package(s) upgradable"
   note "package lists last refreshed ${age}h ago (apt-daily.timer)"
 }
 
 apply_apt() {
   section "APT — applying"
-  sudo apt-get update -q && sudo apt-get full-upgrade -y || { warn "apt failed"; FAILED=true; return 1; }
-  ok "apt done"
-  note "run 'sudo apt autoremove' separately if you want orphans purged"
+  if sudo apt-get update -q && sudo apt-get full-upgrade -y; then
+    ok "apt done"
+    note "run 'sudo apt autoremove' separately if you want orphans purged"
+  else
+    warn "apt failed"; FAILED=true
+  fi
 }
 
 # ── Flatpak ──────────────────────────────────────────────────────────────────
 check_flatpak() {
   section "Flatpak"
-  local scope list count total=0
+  HOWTO[flatpak]='flatpak update'
+  local scope out="" rt
   for scope in user system; do
-    list=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --app --"$scope" \
-             --columns=name,application,version 2>/dev/null | sed -E 's/\t/  /g')
-    count=$(printf '%s' "$list" | grep -c . )
-    if (( count > 0 )); then
-      printf "  %s: %s app(s)\n" "$scope" "$count"
-      printf '%s\n' "$list" | truncate_list
-      total=$(( total + count ))
-    fi
+    out+=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --app --"$scope" \
+             --columns=name,application,version 2>/dev/null \
+           | sed -E "s/\t/  /g; s/$/  [$scope]/")$'\n'
   done
-  # runtimes/extensions, counted but not listed
-  local rt
   rt=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --runtime 2>/dev/null | grep -c . )
-  (( rt > 0 )) && note "plus $rt runtime/extension update(s)"
-  if (( total == 0 && rt == 0 )); then ok "up to date"; else
-    TOTAL=$(( TOTAL + total + rt )); SUMMARY+=("flatpak: $(( total + rt ))")
+  PENDING[flatpak]=$(printf '%s' "$out" | grep . )
+  report flatpak "app(s)"
+  if (( rt > 0 )); then
+    note "plus $rt runtime/extension update(s) — pulled in by the same command"
+    (( ${COUNT[flatpak]:-0} == 0 )) && { COUNT[flatpak]=$rt; TOTAL=$(( TOTAL + rt )); }
   fi
 }
 
 apply_flatpak() {
   section "Flatpak — applying"
-  flatpak update -y --user   || { warn "flatpak --user failed"; FAILED=true; }
-  flatpak update -y --system || { warn "flatpak --system failed (polkit auth?)"; FAILED=true; }
-  ok "flatpak done"
+  local bad=false
+  flatpak update -y --user   || { warn "flatpak --user failed"; bad=true; }
+  flatpak update -y --system || { warn "flatpak --system failed (polkit auth?)"; bad=true; }
+  $bad && FAILED=true || ok "flatpak done"
   note "unused runtimes can be reclaimed with: flatpak uninstall --unused"
 }
 
 # ── npm globals ──────────────────────────────────────────────────────────────
-# Only counts packages whose *latest* is strictly newer than what's installed —
-# `npm outdated` also flags packages sitting ahead of the registry (pre-releases).
+# ENGINE-AWARE. `npm outdated` reports the registry's `latest` dist-tag with no
+# regard for whether the running node can execute it: on node 20 that offered
+# npm@12 (requires node >=22), which npm then refuses with EBADENGINE, and
+# corepack@0.35.0, which installs with only a warning and is then unsupported.
+# So resolve, per package, the newest published version whose engines.node this
+# node actually satisfies — using the semver that npm itself ships.
+npm_best_version() {  # <pkg> → "best<TAB>latest<TAB>latest_engine"
+  local pkg="$1" semver_dir url
+  semver_dir="$("$NPM" root -g 2>/dev/null)/npm/node_modules/semver"
+  [[ -d "$semver_dir" && -x "$NODE" ]] || return 1
+  url="https://registry.npmjs.org/${pkg//\//%2f}"
+  timeout "$NET_TIMEOUT" curl -fsSL "$url" 2>/dev/null | "$NODE" -e '
+    const semver = require(process.argv[1]);
+    let raw = ""; process.stdin.on("data", d => raw += d).on("end", () => {
+      let p; try { p = JSON.parse(raw) } catch (e) { process.exit(1) }
+      const versions = p.versions || {};
+      const latest = (p["dist-tags"] || {}).latest || null;
+      let best = null;
+      for (const [v, m] of Object.entries(versions)) {
+        if (semver.prerelease(v) || m.deprecated) continue;
+        const eng = (m.engines || {}).node;
+        if (eng && !semver.satisfies(process.versions.node, eng)) continue;
+        if (!best || semver.gt(v, best)) best = v;
+      }
+      const latestEngine = latest && (versions[latest].engines || {}).node || "";
+      console.log([best || "", latest || "", latestEngine].join("\t"));
+    })' "$semver_dir"
+}
+
 npm_pending() {
-  [[ -n "$NPM" ]] || return 0
-  local node="${NPM%/npm}/node"
-  [[ -x "$node" ]] || node=$(command -v node 2>/dev/null)
+  [[ -n "$NPM" && -x "$NODE" ]] || return 0
   local json
   json=$(timeout "$NET_TIMEOUT" "$NPM" outdated -g --depth=0 --json 2>/dev/null)
   [[ -z "$json" || "$json" == "{}" ]] && return 0
-  if [[ -x "$node" ]]; then
-    # npm pretty-prints the JSON, so parse it properly rather than by line.
-    printf '%s' "$json" | "$node" -e '
-      let raw=""; process.stdin.on("data",d=>raw+=d).on("end",()=>{
-        let o={}; try { o=JSON.parse(raw) } catch(e) { process.exit(0) }
-        for (const [name,v] of Object.entries(o))
-          if (v.current && v.latest) console.log(`${name}\t${v.current}\t${v.latest}`)
-      })' | while IFS=$'\t' read -r name cur lat; do
-        newer "$cur" "$lat" && printf '%s  %s → %s\n' "$name" "$cur" "$lat"
-      done
-  else
-    warn "node not found — cannot parse npm output" >&2
-  fi
+  printf '%s' "$json" | "$NODE" -e '
+    let raw=""; process.stdin.on("data",d=>raw+=d).on("end",()=>{
+      let o={}; try { o=JSON.parse(raw) } catch(e) { process.exit(0) }
+      for (const [name,v] of Object.entries(o))
+        if (v.current) console.log(`${name}\t${v.current}`)
+    })' | while IFS=$'\t' read -r name cur; do
+      local best latest eng
+      IFS=$'\t' read -r best latest eng < <(npm_best_version "$name")
+      [[ -z "$best" ]] && continue
+      newer "$cur" "$best" || continue
+      if [[ "$best" != "$latest" && -n "$latest" ]]; then
+        printf '%s  %s → %s   (latest %s needs node %s)\n' "$name" "$cur" "$best" "$latest" "${eng:-?}"
+      else
+        printf '%s  %s → %s\n' "$name" "$cur" "$best"
+      fi
+    done
+}
+
+# Globals whose INSTALLED version declares an engines.node this node doesn't
+# satisfy — they are not "outdated" (a compatible version is older), so nothing
+# else would ever report them. corepack@0.35.0 landed here on node 20.
+npm_unsupported() {
+  [[ -n "$NPM" && -x "$NODE" ]] || return 0
+  local root; root="$("$NPM" root -g 2>/dev/null)"
+  local semver_dir="$root/npm/node_modules/semver"
+  [[ -d "$root" && -d "$semver_dir" ]] || return 0
+  "$NODE" -e '
+    const fs = require("fs"), path = require("path");
+    const semver = require(process.argv[2]);
+    const root = process.argv[1];
+    const dirs = [];
+    for (const e of fs.readdirSync(root, {withFileTypes:true})) {
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith("@")) {
+        for (const s of fs.readdirSync(path.join(root, e.name))) dirs.push(path.join(e.name, s));
+      } else dirs.push(e.name);
+    }
+    for (const d of dirs) {
+      let pkg; try { pkg = JSON.parse(fs.readFileSync(path.join(root, d, "package.json"), "utf8")) } catch (e) { continue }
+      const eng = (pkg.engines || {}).node;
+      if (eng && !semver.satisfies(process.versions.node, eng))
+        console.log(`${pkg.name}@${pkg.version} needs node ${eng}`);
+    }' "$root" "$semver_dir" 2>/dev/null
 }
 
 check_npm() {
   section "npm (global)"
-  if [[ -z "$NPM" ]]; then warn "npm not found"; return 0; fi
-  local list count
-  list=$(npm_pending); count=$(printf '%s' "$list" | grep -c . )
-  if (( count == 0 )); then ok "up to date"; else
-    printf "  %s global package(s)\n" "$count"
-    printf '%s\n' "$list" | truncate_list
-    TOTAL=$(( TOTAL + count )); SUMMARY+=("npm: $count")
+  if [[ -z "$NPM" ]]; then warn "npm not found"; COUNT[npm]=0; return 0; fi
+  PENDING[npm]=$(npm_pending)
+  report npm "global package(s)"
+  local cmds=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    cmds+="${cmds:+ && }npm -g install $(awk '{print $1"@"$4}' <<<"$line")"
+  done <<<"${PENDING[npm]}"
+  HOWTO[npm]="${cmds:-npm -g outdated}"
+  note "prefix: $("$NPM" config get prefix 2>/dev/null) · node $("$NODE" -v 2>/dev/null) · ignore-scripts=$("$NPM" config get ignore-scripts 2>/dev/null)"
+  local unsup; unsup=$(npm_unsupported)
+  if [[ -n "$unsup" ]]; then
+    while IFS= read -r line; do warn "unsupported: $line (yours: $("$NODE" -v))"; done <<<"$unsup"
+    note "not an update — a newer node fixes it, or pin back to the last compatible release"
   fi
-  note "prefix: $("$NPM" config get prefix 2>/dev/null) · ignore-scripts=$("$NPM" config get ignore-scripts 2>/dev/null)"
 }
 
 apply_npm() {
   section "npm (global) — applying"
   [[ -n "$NPM" ]] || { warn "npm not found"; return 0; }
-  local pkg
+  local line pkg ver bad=false
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    pkg=${line%% *}
-    echo "  → $pkg"
-    "$NPM" install -g "$pkg@latest" >/dev/null || { warn "$pkg failed"; FAILED=true; }
-  done < <(npm_pending)
-  ok "npm done  (install scripts stayed disabled — global policy)"
+    pkg=$(awk '{print $1}' <<<"$line"); ver=$(awk '{print $4}' <<<"$line")
+    echo "  → $pkg@$ver"
+    "$NPM" install -g "$pkg@$ver" >/dev/null || { warn "$pkg failed"; bad=true; }
+  done <<<"${PENDING[npm]}"
+  $bad && FAILED=true || ok "npm done  (install scripts stayed disabled — global policy)"
 }
 
 # ── Hand-installed .debs ─────────────────────────────────────────────────────
@@ -266,14 +327,11 @@ proton_feed() {  # → version <tab> url <tab> sha512   (stable channel)
 }
 
 deb_pending() {
-  local have want
-  # Discord — delegate to the sibling script so the version logic lives in one place
-  local ud; ud=$(find_update_discord) || ud=""
-  if [[ -n "$ud" ]]; then
+  local have want ud
+  if ud=$(find_update_discord); then
     timeout "$NET_TIMEOUT" "$ud" --check --no-notify 2>/dev/null \
       | sed -nE 's/^Update available: (\S+) -> (\S+)$/discord  \1 → \2/p'
   fi
-  # Proton Mail — upstream publishes a version feed
   if have=$(dpkg-query -W -f='${Version}' proton-mail 2>/dev/null); then
     want=$(proton_feed | cut -f1)
     [[ -n "$want" ]] && dpkg --compare-versions "$have" lt "$want" \
@@ -283,66 +341,62 @@ deb_pending() {
 
 check_deb() {
   section "Hand-installed .debs"
-  local list count
-  list=$(deb_pending); count=$(printf '%s' "$list" | grep -c . )
-  if (( count == 0 )); then ok "up to date"; else
-    printf "  %s package(s)\n" "$count"
-    printf '%s\n' "$list" | truncate_list
-    TOTAL=$(( TOTAL + count )); SUMMARY+=("deb: $count")
-  fi
+  PENDING[deb]=$(deb_pending)
+  report deb "package(s)"
+  local hints=()
+  grep -q '^discord' <<<"${PENDING[deb]}" && hints+=("update-discord")
+  grep -q '^proton-mail' <<<"${PENDING[deb]}" && hints+=("update-all deb")
+  HOWTO[deb]=$(join_list '  ·  ' "${hints[@]:-}")
   note "no apt repo behind these — apt will never offer them"
 }
 
 apply_deb() {
   section "Hand-installed .debs — applying"
-  local line name tmp url sha
+  local line name tmp url sha bad=false
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     name=${line%% *}
     case "$name" in
       discord)
         echo "  → discord"
-        "$(find_update_discord)" || { warn "discord failed"; FAILED=true; }
+        "$(find_update_discord)" || { warn "discord failed"; bad=true; }
         ;;
       proton-mail)
         echo "  → proton-mail"
         IFS=$'\t' read -r _ url sha < <(proton_feed)
-        if [[ -z "$url" ]]; then warn "no download URL in the Proton feed"; FAILED=true; continue; fi
+        if [[ -z "$url" ]]; then warn "no download URL in the Proton feed"; bad=true; continue; fi
         tmp=$(mktemp -d)
         if timeout 600 curl -fL# "$url" -o "$tmp/proton-mail.deb"; then
           # The checksum ships in the same TLS-protected feed as the URL, so this
           # guards against a truncated/corrupt download, not against a bad feed.
           if [[ -n "$sha" ]] && ! echo "$sha  $tmp/proton-mail.deb" | sha512sum -c --status; then
-            warn "proton-mail: SHA512 mismatch — refusing to install"; FAILED=true
+            warn "proton-mail: SHA512 mismatch — refusing to install"; bad=true
           else
-            sudo dpkg -i "$tmp/proton-mail.deb" || { warn "proton-mail install failed"; FAILED=true; }
+            sudo dpkg -i "$tmp/proton-mail.deb" || { warn "proton-mail install failed"; bad=true; }
           fi
         else
-          warn "proton-mail download failed"; FAILED=true
+          warn "proton-mail download failed"; bad=true
         fi
         rm -rf "$tmp"
         ;;
     esac
-  done < <(deb_pending)
-  ok "hand-installed .debs done"
+  done <<<"${PENDING[deb]}"
+  $bad && FAILED=true || ok "hand-installed .debs done"
 }
 
-# ── AI CLIs (standalone binaries, self-updating) ─────────────────────────────
+# ── AI CLIs (standalone binaries) ────────────────────────────────────────────
 ai_pending() {
   local bin have want
-  # claude — native install; the npm registry is the version oracle
   if bin=$(find_bin claude); then
     have=$("$bin" --version 2>/dev/null | grep -oE '^[0-9.]+')
     want=$(timeout "$NET_TIMEOUT" "${NPM:-npm}" view @anthropic-ai/claude-code version 2>/dev/null | tr -d '[:space:]')
     [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" && printf 'claude  %s → %s\n' "$have" "$want"
   fi
-  # codex — same trick against its npm wrapper package
   if bin=$(find_bin codex); then
     have=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
     want=$(timeout "$NET_TIMEOUT" "${NPM:-npm}" view @openai/codex version 2>/dev/null | tr -d '[:space:]')
     [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" && printf 'codex  %s → %s\n' "$have" "$want"
   fi
-  # grok — has a first-class check
   if bin=$(find_bin grok); then
     local json
     json=$(timeout "$NET_TIMEOUT" "$bin" update --check --json 2>/dev/null)
@@ -356,58 +410,120 @@ ai_pending() {
 
 check_ai() {
   section "AI CLIs"
-  local list count
-  list=$(ai_pending); count=$(printf '%s' "$list" | grep -c . )
-  if (( count == 0 )); then ok "up to date"; else
-    printf "  %s CLI(s)\n" "$count"
-    printf '%s\n' "$list" | truncate_list
-    TOTAL=$(( TOTAL + count )); SUMMARY+=("ai: $count")
-  fi
+  PENDING[ai]=$(ai_pending)
+  report ai "CLI(s)"
+  local hints=()
+  grep -q '^claude' <<<"${PENDING[ai]}" && hints+=("claude update")
+  grep -q '^grok'   <<<"${PENDING[ai]}" && hints+=("grok update")
+  grep -q '^codex'  <<<"${PENDING[ai]}" && hints+=("update-all ai")
+  HOWTO[ai]=$(join_list '  ·  ' "${hints[@]:-}")
+  grep -q '^codex' <<<"${PENDING[ai]}" && \
+    note "codex is a release binary — 'codex update' can't self-update it, update-all replaces it"
+}
+
+# codex here is the GitHub release binary (deliberate: leanest trusted channel),
+# so its own `update` bails with "Could not detect the Codex installation method".
+apply_codex() {
+  local bin tmp url asset
+  bin=$(find_bin codex) || return 1
+  url=$(timeout "$NET_TIMEOUT" curl -fsSL https://api.github.com/repos/openai/codex/releases/latest 2>/dev/null \
+        | jq -r '.assets[] | select(.name == "codex-x86_64-unknown-linux-musl.tar.gz") | .browser_download_url')
+  [[ -z "$url" || "$url" == null ]] && { warn "codex: no linux-musl asset in the latest release"; return 1; }
+  tmp=$(mktemp -d)
+  timeout 900 curl -fL# "$url" -o "$tmp/codex.tar.gz" || { warn "codex download failed"; rm -rf "$tmp"; return 1; }
+  tar -xzf "$tmp/codex.tar.gz" -C "$tmp" || { warn "codex: extract failed"; rm -rf "$tmp"; return 1; }
+  asset=$(find "$tmp" -type f -name 'codex*' ! -name '*.tar.gz' | head -n1)
+  [[ -x "$asset" ]] || chmod +x "$asset" 2>/dev/null
+  # Prove the new binary runs before it replaces the working one.
+  if ! "$asset" --version >/dev/null 2>&1; then warn "codex: new binary won't run — keeping the old one"; rm -rf "$tmp"; return 1; fi
+  cp -f "$bin" "$bin.bak" && mv -f "$asset" "$bin" && chmod +x "$bin" || { warn "codex: replace failed"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  echo "    now $("$bin" --version 2>/dev/null) · previous kept at $bin.bak (~$(du -h "$bin.bak" | cut -f1), delete when happy)"
 }
 
 apply_ai() {
   section "AI CLIs — applying"
-  local name bin
+  local line name bin bad=false
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     name=${line%% *}
-    bin=$(find_bin "$name") || continue
     echo "  → $name"
-    "$bin" update || { warn "$name update failed"; FAILED=true; }
-  done < <(ai_pending)
-  ok "AI CLIs done"
+    if [[ "$name" == codex ]]; then
+      apply_codex || { bad=true; }
+    else
+      bin=$(find_bin "$name") || continue
+      "$bin" update || { warn "$name update failed"; bad=true; }
+    fi
+  done <<<"${PENDING[ai]}"
+  $bad && FAILED=true || ok "AI CLIs done"
 }
 
 # ── run ──────────────────────────────────────────────────────────────────────
-printf "\033[1mupdate-all\033[0m — %s · %s\n" "$MODE" "$(date '+%Y-%m-%d %H:%M')"
+printf "\033[1mupdate-all\033[0m — %s\n" "$(date '+%Y-%m-%d %H:%M')"
 
 for s in apt flatpak npm deb ai; do wants "$s" && "check_$s"; done
+
+PENDING_SOURCES=()
+SUMMARY=()
+for s in apt flatpak npm deb ai; do
+  (( ${COUNT[$s]:-0} > 0 )) && { PENDING_SOURCES+=("$s"); SUMMARY+=("$s: ${COUNT[$s]}"); }
+done
 
 echo
 if (( TOTAL == 0 )); then
   printf "\033[1;32mEverything is up to date.\033[0m\n"
-else
-  printf "\033[1;33m%d update(s) pending\033[0m — %s\n" "$TOTAL" "$(join_list ', ' "${SUMMARY[@]}")"
+  exit 0
 fi
 
-if $NOTIFY && (( TOTAL > 0 )); then
+printf "\033[1;33m%d update(s) pending\033[0m — %s\n" "$TOTAL" "$(join_list ', ' "${SUMMARY[@]}")"
+
+# ── how to apply each source by hand ─────────────────────────────────────────
+section "Apply separately"
+for s in "${PENDING_SOURCES[@]}"; do
+  printf "  \033[1m%-8s\033[0m %3d  \033[2m%s\033[0m\n" "$s" "${COUNT[$s]}" "${HOWTO[$s]:-}"
+done
+
+if $NOTIFY; then
   mkdir -p "$CACHE_DIR"
   fingerprint=$(printf '%s' "${SUMMARY[*]}" | md5sum | cut -d' ' -f1)
   if ! $ONLY_NEW || [[ "$fingerprint" != "$(cat "$CACHE_DIR/last" 2>/dev/null)" ]]; then
     send_notification "$TOTAL update(s) available" "$(join_list $'\n' "${SUMMARY[@]}")
-Run: update-all --apply"
+Run: update-all"
   fi
   printf '%s' "$fingerprint" > "$CACHE_DIR/last"
 fi
 
-if [[ "$MODE" == apply ]]; then
-  (( TOTAL == 0 )) && exit 0
-  for s in apt flatpak npm deb ai; do wants "$s" && "apply_$s"; done
+# ── prompt ───────────────────────────────────────────────────────────────────
+# Only on a terminal: an unattended run (timer, pipe, cron) reports and stops.
+if [[ ! -t 0 || ! -t 1 ]]; then
   echo
-  $FAILED && { printf "\033[1;31mSome updates failed — see above.\033[0m\n"; exit 1; }
-  printf "\033[1;32mAll requested updates applied.\033[0m\n"
-  exit 0
+  note "not a terminal — reporting only; run update-all from a shell to apply"
+  exit 10
 fi
 
-(( TOTAL > 0 )) && exit 10
+echo
+read -r -p "Apply now? [y] all · [n] none · or name sources (${PENDING_SOURCES[*]}): " answer
+answer=${answer:-n}
+
+case "$answer" in
+  y|Y|yes|all) CHOSEN=("${PENDING_SOURCES[@]}") ;;
+  n|N|no|"")   echo "Nothing applied."; exit 10 ;;
+  *)
+    CHOSEN=()
+    for want in $answer; do
+      for s in "${PENDING_SOURCES[@]}"; do [[ "$want" == "$s" ]] && CHOSEN+=("$s"); done
+    done
+    if (( ${#CHOSEN[@]} == 0 )); then
+      echo "No pending source matched '$answer' — nothing applied." >&2; exit 10
+    fi
+    ;;
+esac
+
+for s in apt flatpak npm deb ai; do
+  for c in "${CHOSEN[@]}"; do [[ "$c" == "$s" ]] && "apply_$s"; done
+done
+
+echo
+$FAILED && { printf "\033[1;31mSome updates failed — see above.\033[0m\n"; exit 1; }
+printf "\033[1;32mApplied: %s\033[0m\n" "$(join_list ', ' "${CHOSEN[@]}")"
 exit 0

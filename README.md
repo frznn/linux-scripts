@@ -20,14 +20,17 @@ read-only and needs no privileges; applying is always explicit.
 Sources: `apt` · `flatpak` · `npm` · `deb` · `ai`
 
 ```bash
-update-all                       # check everything (default)
-update-all --apply               # apply everything
-update-all --apply flatpak npm   # only these sources
-update-all --notify --only-new   # desktop notification when something is pending
-update-all --full                # don't truncate long lists
+update-all                  # check everything, show how to apply, then prompt
+update-all npm deb          # only these sources (still prompts)
+update-all --notify         # check + desktop notification; never prompts
+update-all --full           # don't truncate long lists
 ```
 
-Exit codes: `0` up to date · `10` updates pending (check mode) · `1` an apply failed.
+There is no `--apply` flag: a run reports what is pending, prints the command that applies each
+source **by hand**, and then asks. The prompt takes `y` (all), `n` (nothing, the default), or a list
+of sources to apply — and appears only on a terminal, so an unattended run reports and stops.
+
+Exit codes: `0` up to date or applied · `10` pending, not applied · `1` an apply failed.
 
 ### Install
 
@@ -78,11 +81,31 @@ comm -23 <(dpkg-query -W -f='${Package}\n' | sort) \
          <(apt-cache dumpavail | awk '/^Package: /{print $2}' | sort -u)
 ```
 
-### Note for nvm users
+### npm targets are engine-aware
 
-npm is resolved via `~/.nvm/alias/default` and its own `bin/` is prepended to `PATH`. Without that,
-a systemd unit's bare `PATH` picks the distro `npm`/`node` and the check reports "up to date" with
-an empty `/usr` prefix — a silent false negative.
+`npm outdated` reports the registry's `latest` dist-tag regardless of whether your node can run it.
+On node 20 that means `npm@12` (needs node ≥22), which npm then refuses with `EBADENGINE`, and
+`corepack@0.35.0`, which installs with a mere warning and is then unsupported. So for each pending
+package `update-all` resolves the newest published version whose `engines.node` your node actually
+satisfies — using the `semver` that npm itself ships — and says why it held back:
+
+```
+npm  10.8.2 → 11.19.0   (latest 12.0.2 needs node ^22.22.2 || ^24.15.0 || >=26.0.0)
+```
+
+It also flags globals whose *installed* version already violates its engines. Those are not
+"outdated" — the compatible release is older — so nothing else would ever report them.
+
+npm itself is resolved via `~/.nvm/alias/default` with its own `bin/` prepended to `PATH`. Without
+that, a systemd unit's bare `PATH` picks the distro `npm`/`node` and the check reports "up to date"
+with an empty `/usr` prefix — a silent false negative.
+
+### codex
+
+Installed here as a GitHub release binary, so `codex update` bails with "Could not detect the Codex
+installation method". `update-all` fetches `codex-x86_64-unknown-linux-musl.tar.gz` from the latest
+release, **runs `--version` on the new binary before it replaces the old one**, and keeps the
+previous binary at `~/.local/bin/codex.bak`.
 
 ## update-discord
 
