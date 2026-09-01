@@ -1,33 +1,78 @@
 #!/usr/bin/env bash
-# claude-session — manage Claude Code session transcripts.
+# claude-session — manage Claude Code session transcripts (all projects on this machine).
 #
 # Sessions are stored as  ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
 # (plus an optional <uuid>/ sidecar dir). Deletion intent is recorded as a
-# marker file "<uuid>.jsonl.delete" next to the transcript — the SAME primitive
-# the dev-workspace SessionEnd cleanup uses. A marked transcript is removed when
-# its session next ends (SessionEnd hook) or, if the session isn't live, on the
-# next Claude Code launch (SessionStart reap) — never while it is still live.
+# marker file "<uuid>.jsonl.delete" next to the transcript. A marked transcript
+# is removed when its session next ends (SessionEnd hook) or, if the session
+# isn't live, on the next Claude Code launch (SessionStart reap) — never while
+# it is still live.
+#
+# Deletion is RECOVERABLE: transcripts are moved to a trash
+# (~/.claude/trash/<date>/<project>/) and auto-purged after 30 days, and every
+# removal is appended to a tombstone log (~/.claude/session-deletions.log).
+# `archive` keeps a compressed copy outside ~/.claude/projects, where Claude
+# Code's own cleanupPeriodDays expiry cannot reach it.
 #
 # An <id> is a full session UUID or any unambiguous PREFIX of one — e.g. the
 # short id shown by `list` (the first block). An ambiguous prefix is rejected
 # and its candidates are listed, so nothing is deleted by guess.
 #
 # Subcommands:
-#   list [-l]            show sessions newest-first: short-id · title; [MARKED] = marked.
-#                        -l / --long prints full UUIDs instead of short ids.
+#   list [opts]          sessions newest-first: date · size · short-id · project · title
+#                        -l/--long full UUIDs · --marked · --live · --project <substr>
+#                        --since <date> · --limit <n>
 #   mark   [<id>]        mark a session for deletion (default: the current session)
 #   unmark <id>          remove a session's deletion marker
 #   marked               list sessions currently marked for deletion
-#   delete [-f] <id>...  delete transcript(s) RIGHT NOW; refuses a LIVE session
-#                        (one a running Claude Code owns) unless -f/--force is given
-#   reap   [<current>]   delete every MARKED, non-live session (used by the SessionStart hook)
+#   delete [opts] <id>…  delete now → trash; --purge unlinks outright (unrecoverable);
+#                        refuses a LIVE session unless -f/--force
+#   reap   [<current>]   trash every MARKED, non-live session (SessionStart hook)
+#   end    <transcript>  marker-gated removal of one transcript (SessionEnd hook)
 #
-# Env overrides: CLAUDE_PROJECTS_DIR, CLAUDE_SESSIONS_DIR, CLAUDE_SESSION_ID.
-set -euo pipefail
+#   trash                list trashed sessions and when each expires
+#   restore <id>         bring a session back from the trash (or from the archive)
+#   purge [opts]         drop expired trash; --older-than <n> · --all · -n/--dry-run
+#   archive [opts]       gzip transcripts into ~/.claude/archive (keeps the original)
+#                        --older-than <n> · --prune · --auto · -n/--dry-run
+#   archived             list archived sessions
+#
+#   history <id> [opts]  replay a session's PROMPTS from ~/.claude/history.jsonl —
+#                        works even when the transcript is gone. --oneline · -n <n>
+#   orphans              sessions present in history.jsonl with no transcript anywhere
+#   log [-n <n>]         show the tombstone log (what was removed, when, by which path)
+#   doctor               audit the invariants that keep transcripts alive
+#
+# Env overrides: CLAUDE_PROJECTS_DIR, CLAUDE_SESSIONS_DIR, CLAUDE_SESSION_ID,
+#   CLAUDE_SESSION_TRASH, CLAUDE_SESSION_ARCHIVE, CLAUDE_SESSION_LOG,
+#   CLAUDE_HISTORY_FILE, CLAUDE_SETTINGS_FILE, CLAUDE_SESSION_CACHE,
+#   CLAUDE_SESSION_REPO, CLAUDE_SESSION_TRASH_TTL_DAYS,
+#   CLAUDE_SESSION_ARCHIVE_MIN_AGE_DAYS.
+# NOTE: deliberately NOT `set -o pipefail`. This script is full of `… | head -1`
+# idioms; on a large transcript the upstream stage takes SIGPIPE when `head` exits
+# early, and pipefail would turn that into a fatal 141 under `set -e` — which
+# silently truncated `list` output partway down. Statuses are checked explicitly.
+set -eu
 
 PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+LIVE_REGISTRY="${CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
+TRASH_DIR="${CLAUDE_SESSION_TRASH:-$HOME/.claude/trash}"
+ARCHIVE_DIR="${CLAUDE_SESSION_ARCHIVE:-$HOME/.claude/archive}"
+LOG_FILE="${CLAUDE_SESSION_LOG:-$HOME/.claude/session-deletions.log}"
+HISTORY_FILE="${CLAUDE_HISTORY_FILE:-$HOME/.claude/history.jsonl}"
+SETTINGS_FILE="${CLAUDE_SETTINGS_FILE:-$HOME/.claude/settings.json}"
+CACHE_DIR="${CLAUDE_SESSION_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-session}"
+REPO_DIR="${CLAUDE_SESSION_REPO:-$HOME/dev/frznn/linux-scripts/claude-session}"
+TRASH_TTL_DAYS="${CLAUDE_SESSION_TRASH_TTL_DAYS:-30}"
+ARCHIVE_MIN_AGE_DAYS="${CLAUDE_SESSION_ARCHIVE_MIN_AGE_DAYS:-1}"
 
-die() { echo "claude-session: $*" >&2; exit 1; }
+if [ -t 1 ]; then C_G=$'\033[32m'; C_Y=$'\033[33m'; C_R=$'\033[31m'; C_D=$'\033[2m'; C_0=$'\033[0m'
+else C_G=""; C_Y=""; C_R=""; C_D=""; C_0=""; fi
+
+die()     { echo "claude-session: $*" >&2; exit 1; }
+have_jq() { command -v jq >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- discovery --
 
 # Emit the transcript file and sidecar dir belonging to a session id (if any).
 paths_for() {
@@ -49,16 +94,29 @@ marked_ids() {
     | sed -e 's#.*/##' -e 's/\.jsonl\.delete$//'
 }
 
-# Latest AI-generated title for a session transcript ("" if none / no jq).
-title_for() {
-  command -v jq >/dev/null 2>&1 || return 0
-  jq -r 'select(.type=="ai-title") | .aiTitle // empty' "$1" 2>/dev/null | tail -1
-}
-
 # All known session ids (basenames of the transcript files).
 all_ids() {
   [ -d "$PROJECTS_DIR" ] || return 0
   find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' -printf '%f\n' 2>/dev/null | sed 's/\.jsonl$//'
+}
+
+trashed_ids() {
+  [ -d "$TRASH_DIR" ] || return 0
+  find "$TRASH_DIR" -mindepth 3 -maxdepth 3 -name '*.jsonl' -printf '%f\n' 2>/dev/null | sed 's/\.jsonl$//'
+}
+
+archived_ids() {
+  [ -d "$ARCHIVE_DIR" ] || return 0
+  find "$ARCHIVE_DIR" -mindepth 2 -maxdepth 2 -name '*.jsonl.gz' -printf '%f\n' 2>/dev/null | sed 's/\.jsonl\.gz$//'
+}
+
+history_ids() {
+  [ -r "$HISTORY_FILE" ] || return 0
+  if have_jq; then
+    jq -r '.sessionId // empty' "$HISTORY_FILE" 2>/dev/null | sort -u
+  else
+    sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$HISTORY_FILE" | sort -u
+  fi
 }
 
 # Resolve <query> against candidate ids on stdin. Prints the full id and returns
@@ -78,11 +136,19 @@ _resolve() {
   esac
 }
 
+# Resolve $1 against the id list produced by the function named in $2, or die.
+resolve_or_die() {
+  local q="$1" src="$2" what="${3:-session}" id rc=0
+  id="$("$src" | _resolve "$q")" || rc=$?
+  [ "$rc" = 2 ] && exit 1
+  { [ "$rc" = 0 ] && [ -n "$id" ]; } || die "no $what matches '$q'"
+  printf '%s\n' "$id"
+}
+
 # Session ids that are currently LIVE. Claude Code writes one
 # ~/.claude/sessions/<pid>.json per running process (with its .sessionId); we
 # trust an entry only if <pid> is still a running process (skips stale/crashed
 # files). Also includes this command's own session from the environment.
-LIVE_REGISTRY="${CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
 live_ids() {
   {
     if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then echo "$CLAUDE_CODE_SESSION_ID"; fi
@@ -94,7 +160,7 @@ live_ids() {
         pid="$(basename "$f" .json)"
         case "$pid" in *[!0-9]*|'') continue;; esac   # only numeric <pid>.json
         [ -d "/proc/$pid" ] || continue               # skip stale (dead pid)
-        if command -v jq >/dev/null 2>&1; then
+        if have_jq; then
           sid="$(jq -r '.sessionId // empty' "$f" 2>/dev/null)"
         else
           sid="$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)"
@@ -105,22 +171,146 @@ live_ids() {
   } | sort -u
 }
 
+# ------------------------------------------------------------------ helpers --
+
+# Human-readable byte size, no subprocess.
+hsize() {
+  local b="${1:-0}"
+  if   [ "$b" -ge 1048576 ]; then printf '%d.%dM' $((b/1048576)) $(( (b%1048576)*10/1048576 ))
+  elif [ "$b" -ge 1024 ];    then printf '%dK' $((b/1024))
+  else                            printf '%dB' "$b"; fi
+}
+
+# Abbreviate $HOME to ~ and clip to $2 chars (keeping the tail).
+short_path() {
+  local p="${1:-}" w="${2:-26}"
+  case "$p" in "$HOME"/*) p="~${p#$HOME}";; "$HOME") p='~';; esac
+  if [ "${#p}" -gt "$w" ]; then p="…${p: -$((w-1))}"; fi
+  printf '%s' "$p"
+}
+
+# Per-transcript metadata (cwd + AI title) in ONE jq pass, memoised in
+# $CACHE_DIR keyed by mtime+size — `list` used to re-scan every transcript.
+# Sets META_CWD / META_TITLE.
+META_CWD=""; META_TITLE=""
+meta_for() {
+  local f="$1" sig cache out csig
+  META_CWD=""; META_TITLE=""
+  [ -r "$f" ] || return 0
+  sig="$(stat -c '%Y %s' "$f" 2>/dev/null || echo '0 0')"
+  cache="$CACHE_DIR/$(basename "$f" .jsonl).meta"
+  if [ -r "$cache" ]; then
+    { read -r csig || true; read -r META_CWD || true; read -r META_TITLE || true; } < "$cache"
+    [ "${csig:-}" = "$sig" ] && return 0
+    META_CWD=""; META_TITLE=""
+  fi
+  if have_jq; then
+    out="$(jq -r '
+      if ((.cwd? // "") != "") then "C\t" + .cwd
+      elif (.type? == "ai-title") then "T\t" + (.aiTitle // "")
+      else empty end' "$f" 2>/dev/null || true)"
+    # first cwd + last title in a single pass (no `head`/`tail` pipe to break)
+    local both
+    both="$(printf '%s\n' "$out" | awk -F'\t' '
+      $1=="C" && c=="" { c=$2 } $1=="T" { t=$2 }
+      END { print c; print t }')"
+    META_CWD="$(printf '%s' "$both" | sed -n 1p)"
+    META_TITLE="$(printf '%s' "$both" | sed -n 2p)"
+  fi
+  mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+  printf '%s\n%s\n%s\n' "$sig" "$META_CWD" "$META_TITLE" > "$cache" 2>/dev/null || true
+}
+
+# How many prompts ~/.claude/history.jsonl still holds for a session.
+prompt_count() {
+  local id="$1" n=0
+  [ -r "$HISTORY_FILE" ] || { echo 0; return 0; }
+  if have_jq; then
+    n="$(jq -r --arg id "$id" 'select(.sessionId == $id) | 1' "$HISTORY_FILE" 2>/dev/null | wc -l | tr -d ' ')"
+  else
+    n="$(grep -cF "\"$id\"" "$HISTORY_FILE" 2>/dev/null || true)"
+  fi
+  echo "${n:-0}"
+}
+
+# One tombstone line per removal, so "what happened to X?" always has an answer.
+# ts <TAB> action <TAB> id <TAB> project <TAB> bytes <TAB> prompts <TAB> source <TAB> title
+log_event() {
+  local ts; ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  local clean; clean="$(printf '%s' "${7:-}" | tr '\t\n' '  ')"
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$ts" "${1:-?}" "${2:-?}" "${3:-?}" "${4:-0}" "${5:-0}" "${6:-?}" "$clean" \
+    >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Move one transcript (+ marker + sidecar) into the trash and record it.
+# $1 = transcript path, $2 = source tag (mark/delete/reap/session-end/…).
+trash_path() {
+  local t="$1" src="${2:-?}" id proj day dest bytes prompts
+  [ -f "$t" ] || return 1
+  id="$(basename "$t" .jsonl)"
+  proj="$(basename "$(dirname "$t")")"
+  bytes="$(stat -c %s "$t" 2>/dev/null || echo 0)"
+  prompts="$(prompt_count "$id")"
+  meta_for "$t"
+  day="$(date +%F)"
+  dest="$TRASH_DIR/$day/$proj"
+  mkdir -p "$dest" || return 1
+  rm -rf -- "$dest/$id.jsonl" "$dest/$id"
+  mv -f -- "$t" "$dest/$id.jsonl" || return 1
+  local side="${t%.jsonl}"
+  [ "$side" != "$t" ] && [ -d "$side" ] && mv -f -- "$side" "$dest/$id"
+  rm -f -- "$t.delete" "$CACHE_DIR/$id.meta"
+  log_event trash "$id" "${META_CWD:-$proj}" "$bytes" "$prompts" "$src" "$META_TITLE"
+  return 0
+}
+
+# ------------------------------------------------------------------- list ----
+
 cmd_list() {
-  local long=0
-  case "${1:-}" in -l|--long) long=1;; esac
-  local marked_list; marked_list="$(marked_ids)"
-  local id show sz mt flag f title
-  find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
-    | sort -rn | while read -r _ f; do
-      id="$(basename "$f" .jsonl)"
-      if [ "$long" = 1 ]; then show="$id"; else show="${id%%-*}"; fi
-      sz="$(du -h "$f" 2>/dev/null | cut -f1)"
-      mt="$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null)"
-      title="$(title_for "$f")"
-      flag=""
-      if printf '%s\n' "$marked_list" | grep -qxF "$id"; then flag="  [MARKED]"; fi
-      printf '%s  %5s  %-8s  %s%s\n' "$mt" "${sz:-?}" "$show" "${title:-(untitled)}" "$flag"
-    done
+  local long=0 only_marked=0 only_live=0 proj_filter="" since="" limit=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -l|--long)   long=1;;
+      --marked)    only_marked=1;;
+      --live)      only_live=1;;
+      --project)   proj_filter="${2:?--project needs a substring}"; shift;;
+      --since)     since="${2:?--since needs a date}"; shift;;
+      --limit)     limit="${2:?--limit needs a number}"; shift;;
+      -h|--help)   echo "usage: claude-session list [-l] [--marked] [--live] [--project <s>] [--since <date>] [--limit <n>]"; return 0;;
+      *)           die "list: unknown option '$1'";;
+    esac
+    shift
+  done
+  local since_epoch=0
+  if [ -n "$since" ]; then
+    since_epoch="$(date -d "$since" +%s 2>/dev/null)" || die "list: unparseable --since '$since'"
+  fi
+  local marked_list live_list; marked_list="$(marked_ids)"; live_list="$(live_ids)"
+  local n=0 epoch when bytes f id show flags proj
+  while IFS=$'\t' read -r epoch when bytes f; do
+    [ -n "${f:-}" ] || continue
+    id="$(basename "$f" .jsonl)"
+    [ "$since_epoch" != 0 ] && [ "${epoch%.*}" -lt "$since_epoch" ] && continue
+    flags=""
+    printf '%s\n' "$marked_list" | grep -qxF "$id" && flags="$flags [MARKED]"
+    printf '%s\n' "$live_list"   | grep -qxF "$id" && flags="$flags [LIVE]"
+    [ "$only_marked" = 1 ] && case "$flags" in *MARKED*) :;; *) continue;; esac
+    [ "$only_live"   = 1 ] && case "$flags" in *LIVE*)   :;; *) continue;; esac
+    meta_for "$f"
+    proj="${META_CWD:-$(basename "$(dirname "$f")")}"
+    if [ -n "$proj_filter" ]; then case "$proj" in *"$proj_filter"*) :;; *) continue;; esac; fi
+    if [ "$long" = 1 ]; then show="$id"; else show="${id%%-*}"; fi
+    printf '%s  %6s  %-*s  %-26s  %s%s\n' \
+      "$when" "$(hsize "$bytes")" "$([ "$long" = 1 ] && echo 36 || echo 8)" "$show" \
+      "$(short_path "$proj" 26)" "${META_TITLE:-(untitled)}" "$flags"
+    n=$((n+1))
+    [ "$limit" != 0 ] && [ "$n" -ge "$limit" ] && break
+  done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' \
+             -printf '%T@\t%TY-%Tm-%Td %TH:%TM\t%s\t%p\n' 2>/dev/null | sort -rn)
+  [ "$n" = 0 ] && echo "(no sessions match)"
+  return 0
 }
 
 cmd_marked() {
@@ -132,10 +322,7 @@ cmd_marked() {
 cmd_mark() {
   local q="${1:-${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}}"
   [ -n "$q" ] || die "no session id given and no current session in the environment"
-  local id rc=0
-  id="$(all_ids | _resolve "$q")" || rc=$?
-  [ "$rc" = 2 ] && exit 1
-  { [ "$rc" = 0 ] && [ -n "$id" ]; } || die "no session matches '$q'"
+  local id; id="$(resolve_or_die "$q" all_ids session)"
   local t; t="$(transcript_for "$id")"
   [ -n "$t" ] || die "no transcript file found for '$id'"
   if [ -e "$t.delete" ]; then
@@ -143,16 +330,14 @@ cmd_mark() {
   else
     : > "$t.delete"
     echo "marked for deletion: $id"
-    echo "  removed when it next ends, or on next launch if it isn't live (never while live)."
+    echo "  moved to the trash when it next ends, or on next launch if it isn't live (never while live)."
+    echo "  recoverable with 'claude-session restore $id' for $TRASH_TTL_DAYS days."
   fi
 }
 
 cmd_unmark() {
   local q="${1:?usage: claude-session unmark <id>}"
-  local id rc=0
-  id="$(marked_ids | _resolve "$q")" || rc=$?
-  [ "$rc" = 2 ] && exit 1
-  { [ "$rc" = 0 ] && [ -n "$id" ]; } || die "no marked session matches '$q'"
+  local id; id="$(resolve_or_die "$q" marked_ids "marked session")"
   local t; t="$(transcript_for "$id")"
   if [ -n "$t" ]; then
     rm -f -- "$t.delete"
@@ -163,11 +348,19 @@ cmd_unmark() {
 }
 
 cmd_delete() {
-  local force=0
-  case "${1:-}" in -f|--force) force=1; shift;; esac
-  [ "$#" -ge 1 ] || die "usage: claude-session delete [-f] <id> [id...]"
+  local force=0 purge=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1;;
+      --purge)    purge=1;;
+      -*)         die "delete: unknown option '$1'";;
+      *)          break;;
+    esac
+    shift
+  done
+  [ "$#" -ge 1 ] || die "usage: claude-session delete [-f] [--purge] <id> [id...]"
   local live; live="$(live_ids)"
-  local q id rc p found t err=0
+  local q id rc t err=0
   for q in "$@"; do
     rc=0; id="$(all_ids | _resolve "$q")" || rc=$?
     [ "$rc" = 2 ] && { err=1; continue; }           # ambiguous — candidates already listed
@@ -178,13 +371,20 @@ cmd_delete() {
       err=1; continue
     fi
     t="$(transcript_for "$id")"
-    found=0
-    while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      rm -rf -- "$p"; found=1
-    done < <(paths_for "$id")
-    [ -n "$t" ] && rm -f -- "$t.delete"             # drop the marker too, if any
-    if [ "$found" = 1 ]; then echo "deleted: $id"; else echo "not found: $id"; err=1; fi
+    if [ -z "$t" ]; then echo "not found: $id"; err=1; continue; fi
+    if [ "$purge" = 1 ]; then
+      local bytes prompts proj
+      bytes="$(stat -c %s "$t" 2>/dev/null || echo 0)"
+      prompts="$(prompt_count "$id")"; proj="$(basename "$(dirname "$t")")"
+      meta_for "$t"
+      local p
+      while IFS= read -r p; do [ -n "$p" ] || continue; rm -rf -- "$p"; done < <(paths_for "$id")
+      rm -f -- "$t.delete" "$CACHE_DIR/$id.meta"
+      log_event purge "$id" "${META_CWD:-$proj}" "$bytes" "$prompts" "delete --purge" "$META_TITLE"
+      echo "purged (unrecoverable): $id"
+    else
+      trash_path "$t" delete && echo "trashed: $id  (restore with: claude-session restore $id)"
+    fi
   done
   return "$err"
 }
@@ -192,33 +392,403 @@ cmd_delete() {
 cmd_reap() {
   local current="${1:-${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}}"
   local live; live="$( { live_ids; if [ -n "$current" ]; then printf '%s\n' "$current"; fi; } | sort -u )"
-  local marker id t side reaped=0
+  local marker id t reaped=0
   while IFS= read -r marker; do
     [ -n "$marker" ] || continue
     id="$(basename "$marker" .jsonl.delete)"
     if printf '%s\n' "$live" | grep -qxF "$id"; then continue; fi   # never touch a live session
-    t="${marker%.delete}"                                          # the .jsonl transcript
-    rm -f -- "$t" "$marker"
-    side="${t%.jsonl}"                                             # optional sidecar dir
-    if [ "$side" != "$t" ] && [ -d "$side" ]; then rm -rf -- "$side"; fi
+    t="${marker%.delete}"
+    if [ -f "$t" ]; then
+      trash_path "$t" reap || true
+    else
+      rm -f -- "$marker"                                            # stale marker, no transcript
+    fi
     reaped=$((reaped+1))
     echo "claude-session: reaped $id" >&2
   done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl.delete' 2>/dev/null)
-  [ "$reaped" -gt 0 ] && echo "claude-session: reaped $reaped marked session(s)" >&2
+  [ "$reaped" -gt 0 ] && echo "claude-session: reaped $reaped marked session(s) to the trash" >&2
   return 0
 }
+
+# SessionEnd hook path: the session has just ended, so it is safe to act on its
+# own transcript — no live guard here, unlike `reap`.
+cmd_end() {
+  local t="${1:?usage: claude-session end <transcript-path>}"
+  [ -f "$t.delete" ] || return 0
+  if [ -f "$t" ]; then trash_path "$t" session-end || true; else rm -f -- "$t.delete"; fi
+  return 0
+}
+
+# ------------------------------------------------------------------ trash ----
+
+cmd_trash() {
+  [ -d "$TRASH_DIR" ] || { echo "(trash is empty)"; return 0; }
+  local n=0 day proj id f bytes left cutoff_days
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    id="$(basename "$f" .jsonl)"
+    proj="$(basename "$(dirname "$f")")"
+    day="$(basename "$(dirname "$(dirname "$f")")")"
+    bytes="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    left="?"
+    if cutoff_days="$(date -d "$day" +%s 2>/dev/null)"; then
+      left=$(( (cutoff_days + TRASH_TTL_DAYS*86400 - $(date +%s)) / 86400 ))
+      [ "$left" -lt 0 ] && left=0
+    fi
+    printf '%s  %6s  %-8s  %-26s  expires in %sd\n' \
+      "$day" "$(hsize "$bytes")" "${id%%-*}" "$(short_path "$proj" 26)" "$left"
+    n=$((n+1))
+  done < <(find "$TRASH_DIR" -mindepth 3 -maxdepth 3 -name '*.jsonl' 2>/dev/null | sort -r)
+  [ "$n" = 0 ] && echo "(trash is empty)"
+  return 0
+}
+
+cmd_restore() {
+  local q="${1:?usage: claude-session restore <id>}"
+  local id; id="$(resolve_or_die "$q" _restorable_ids "trashed or archived session")"
+  local dest_dir dest src proj
+
+  # Trash first (a full transcript beats a compressed copy of an older one).
+  src="$(find "$TRASH_DIR" -mindepth 3 -maxdepth 3 -name "$id.jsonl" 2>/dev/null | sort -r | head -1)"
+  if [ -n "$src" ]; then
+    proj="$(basename "$(dirname "$src")")"
+    dest_dir="$PROJECTS_DIR/$proj"; dest="$dest_dir/$id.jsonl"
+    [ -e "$dest" ] && die "a transcript already exists at $dest — not overwriting"
+    mkdir -p "$dest_dir"
+    mv -f -- "$src" "$dest"
+    local side="${src%.jsonl}"
+    [ -d "$side" ] && mv -f -- "$side" "$dest_dir/$id"
+    rmdir -p --ignore-fail-on-non-empty "$(dirname "$src")" 2>/dev/null || true
+    log_event restore "$id" "$proj" "$(stat -c %s "$dest" 2>/dev/null || echo 0)" \
+      "$(prompt_count "$id")" trash ""
+    echo "restored from trash: $id → $dest"
+    return 0
+  fi
+
+  # Fall back to the archive (decompress a copy; the .gz stays put).
+  src="$(find "$ARCHIVE_DIR" -mindepth 2 -maxdepth 2 -name "$id.jsonl.gz" 2>/dev/null | head -1)"
+  [ -n "$src" ] || die "no trashed or archived copy of '$id'"
+  proj="$(basename "$(dirname "$src")")"
+  dest_dir="$PROJECTS_DIR/$proj"; dest="$dest_dir/$id.jsonl"
+  [ -e "$dest" ] && die "a transcript already exists at $dest — not overwriting"
+  mkdir -p "$dest_dir"
+  gunzip -c -- "$src" > "$dest.part" && mv -f -- "$dest.part" "$dest"
+  log_event restore "$id" "$proj" "$(stat -c %s "$dest" 2>/dev/null || echo 0)" \
+    "$(prompt_count "$id")" archive ""
+  echo "restored from archive: $id → $dest"
+}
+
+_restorable_ids() { { trashed_ids; archived_ids; } | sort -u; }
+
+cmd_purge() {
+  local older="$TRASH_TTL_DAYS" all=0 dry=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --older-than) older="${2:?--older-than needs a number of days}"; shift;;
+      --all)        all=1;;
+      -n|--dry-run) dry=1;;
+      --expired)    :;;                     # the default; accepted for clarity in hooks
+      *)            die "purge: unknown option '$1'";;
+    esac
+    shift
+  done
+  [ -d "$TRASH_DIR" ] || return 0
+  local now cutoff d day d_epoch f id proj bytes n=0
+  now="$(date +%s)"; cutoff=$(( now - older*86400 ))
+  for d in "$TRASH_DIR"/*/; do
+    [ -d "$d" ] || continue
+    day="$(basename "$d")"
+    if [ "$all" != 1 ]; then
+      d_epoch="$(date -d "$day" +%s 2>/dev/null)" || continue     # unparseable name: leave it
+      [ "$d_epoch" -ge "$cutoff" ] && continue
+    fi
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      id="$(basename "$f" .jsonl)"; proj="$(basename "$(dirname "$f")")"
+      bytes="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+      if [ "$dry" = 1 ]; then
+        echo "would purge: $day  ${id%%-*}  $proj  $(hsize "$bytes")"
+      else
+        log_event purge "$id" "$proj" "$bytes" "$(prompt_count "$id")" "trash-expiry(${older}d)" ""
+      fi
+      n=$((n+1))
+    done < <(find "$d" -mindepth 2 -maxdepth 2 -name '*.jsonl' 2>/dev/null)
+    [ "$dry" = 1 ] || rm -rf -- "$d"
+  done
+  if [ "$n" -gt 0 ] && [ "$dry" != 1 ]; then
+    echo "claude-session: purged $n expired session(s) from the trash" >&2
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- archive ----
+
+cmd_archive() {
+  local older="$ARCHIVE_MIN_AGE_DAYS" prune=0 dry=0 quiet=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --older-than) older="${2:?--older-than needs a number of days}"; shift;;
+      --prune)      prune=1;;
+      --auto)       quiet=1;;
+      -n|--dry-run) dry=1;;
+      *)            die "archive: unknown option '$1'";;
+    esac
+    shift
+  done
+  local f id proj gz n=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    id="$(basename "$f" .jsonl)"; proj="$(basename "$(dirname "$f")")"
+    gz="$ARCHIVE_DIR/$proj/$id.jsonl.gz"
+    [ -f "$gz" ] && [ "$gz" -nt "$f" ] && continue          # already archived, unchanged since
+    if [ "$dry" = 1 ]; then echo "would archive: ${id%%-*}  $proj"; n=$((n+1)); continue; fi
+    mkdir -p "$ARCHIVE_DIR/$proj" || continue
+    gzip -c -- "$f" > "$gz.part" 2>/dev/null && mv -f -- "$gz.part" "$gz" || { rm -f -- "$gz.part"; continue; }
+    n=$((n+1))
+    [ "$quiet" = 1 ] || echo "archived: ${id%%-*}  →  $gz"
+    if [ "$prune" = 1 ]; then trash_path "$f" archive-prune || true; fi
+  done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' -mtime "+$older" 2>/dev/null)
+  if [ "$quiet" != 1 ] && [ "$n" = 0 ]; then echo "(nothing to archive)"; fi
+  return 0
+}
+
+cmd_archived() {
+  [ -d "$ARCHIVE_DIR" ] || { echo "(archive is empty)"; return 0; }
+  local n=0 f id proj bytes when
+  while IFS=$'\t' read -r when bytes f; do
+    [ -n "${f:-}" ] || continue
+    id="$(basename "$f" .jsonl.gz)"; proj="$(basename "$(dirname "$f")")"
+    printf '%s  %6s  %-8s  %s\n' "$when" "$(hsize "$bytes")" "${id%%-*}" "$(short_path "$proj" 40)"
+    n=$((n+1))
+  done < <(find "$ARCHIVE_DIR" -mindepth 2 -maxdepth 2 -name '*.jsonl.gz' \
+             -printf '%TY-%Tm-%Td %TH:%TM\t%s\t%p\n' 2>/dev/null | sort -r)
+  [ "$n" = 0 ] && echo "(archive is empty)"
+  return 0
+}
+
+# ---------------------------------------------------- history / salvage ------
+
+cmd_history() {
+  local q="" oneline=0 limit=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --oneline) oneline=1;;
+      -n|--limit) limit="${2:?-n needs a number}"; shift;;
+      -*) die "history: unknown option '$1'";;
+      *)  q="$1";;
+    esac
+    shift
+  done
+  [ -n "$q" ] || die "usage: claude-session history <id> [--oneline] [-n <n>]"
+  [ -r "$HISTORY_FILE" ] || die "no history file at $HISTORY_FILE"
+  have_jq || die "history needs jq"
+  local id; id="$(resolve_or_die "$q" _known_ids "session")"
+  local total; total="$(prompt_count "$id")"
+  [ "$total" -gt 0 ] || die "no prompts recorded for '$id' in $(short_path "$HISTORY_FILE" 60)"
+  local where="transcript present"
+  [ -n "$(transcript_for "$id")" ] || where="TRANSCRIPT GONE — prompts only, no assistant replies"
+  echo "session $id — $total prompt(s) — $where"
+  echo
+  local n=0 line ts disp
+  while IFS=$'\t' read -r ts disp; do
+    n=$((n+1))
+    [ "$limit" != 0 ] && [ "$n" -gt "$limit" ] && { echo "… ($((total-limit)) more)"; break; }
+    if [ "$oneline" = 1 ]; then
+      printf '%s  %s\n' "$ts" "$(printf '%s' "$disp" | head -c 100)"
+    else
+      printf '\n%s── %s ─ #%d ──%s\n%s\n' "$C_D" "$ts" "$n" "$C_0" "$(printf '%b' "$disp")"
+    fi
+  done < <(jq -r --arg id "$id" '
+      select(.sessionId == $id)
+      | ((.timestamp / 1000) | strflocaltime("%Y-%m-%d %H:%M"))
+        + "\t" + ((.display // "") | gsub("\n"; "\\n"))' "$HISTORY_FILE" 2>/dev/null)
+}
+
+_known_ids() { { all_ids; trashed_ids; archived_ids; history_ids; } | sort -u; }
+
+cmd_orphans() {
+  [ -r "$HISTORY_FILE" ] || die "no history file at $HISTORY_FILE"
+  have_jq || die "orphans needs jq"
+  local tmp_h tmp_have
+  tmp_h="$(mktemp)"; tmp_have="$(mktemp)"
+  trap 'rm -f "$tmp_h" "$tmp_have"' RETURN
+  history_ids > "$tmp_h"
+  { all_ids; trashed_ids; archived_ids; } | sort -u > "$tmp_have"
+  local n=0 id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    local info
+    info="$(jq -r --arg id "$id" '
+        select(.sessionId == $id)
+        | [ (.timestamp/1000 | strflocaltime("%Y-%m-%d")), (.project // "?"), ((.display // "") | gsub("\n"; " ")) ]
+        | @tsv' "$HISTORY_FILE" 2>/dev/null)"
+    local first last proj label cnt
+    first="$(printf '%s\n' "$info" | head -1 | cut -f1)"
+    last="$(printf '%s\n' "$info"  | tail -1 | cut -f1)"
+    proj="$(printf '%s\n' "$info"  | head -1 | cut -f2)"
+    label="$(printf '%s\n' "$info" | head -1 | cut -f3 | head -c 44)"
+    cnt="$(printf '%s\n' "$info" | grep -c . || true)"
+    printf '%-8s  %4s prompts  %s → %s  %-20s  %s\n' \
+      "${id%%-*}" "$cnt" "$first" "$last" "$(short_path "$proj" 20)" "$label"
+    n=$((n+1))
+  done < <(comm -23 "$tmp_h" "$tmp_have")
+  if [ "$n" = 0 ]; then
+    echo "(no orphans — every session in history.jsonl still has a transcript, trash or archive copy)"
+  else
+    echo
+    echo "$n session(s) survive only as prompts in $(short_path "$HISTORY_FILE" 60)."
+    echo "Read one with: claude-session history <short-id>"
+  fi
+  return 0
+}
+
+cmd_log() {
+  local limit=40
+  case "${1:-}" in -n|--limit) limit="${2:?-n needs a number}";; esac
+  [ -r "$LOG_FILE" ] || { echo "(no removals recorded yet — $LOG_FILE does not exist)"; return 0; }
+  printf '%-16s  %-8s  %-8s  %6s  %5s  %-18s  %-22s  %s\n' WHEN ACTION ID SIZE PRMT SOURCE PROJECT TITLE
+  tail -n "$limit" "$LOG_FILE" | while IFS=$'\t' read -r ts action id proj bytes prompts src title; do
+    printf '%-16s  %-8s  %-8s  %6s  %5s  %-18s  %-22s  %s\n' \
+      "${ts:0:16}" "$action" "${id%%-*}" "$(hsize "${bytes:-0}")" "${prompts:-0}" "${src:-?}" \
+      "$(short_path "${proj:-?}" 22)" "${title:-}"
+  done
+}
+
+# ----------------------------------------------------------------- doctor ----
+
+DOC_FAIL=0
+_ok()   { printf '  %sok%s    %s\n' "$C_G" "$C_0" "$*"; }
+_warn() { printf '  %swarn%s  %s\n' "$C_Y" "$C_0" "$*"; }
+_fail() { printf '  %sFAIL%s  %s\n' "$C_R" "$C_0" "$*"; DOC_FAIL=1; }
+
+# Expand a leading ~ and take the command word out of a hook command string.
+_hook_path() { local c="${1:-}"; c="${c%% *}"; case "$c" in "~"*) c="$HOME${c#\~}";; esac; printf '%s' "$c"; }
+
+cmd_doctor() {
+  echo "settings ($SETTINGS_FILE)"
+  if [ ! -r "$SETTINGS_FILE" ]; then
+    _fail "unreadable — cannot verify cleanupPeriodDays or hook wiring"
+  elif ! have_jq; then
+    _warn "jq missing — skipping settings checks"
+  else
+    local cpd; cpd="$(jq -r '.cleanupPeriodDays // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+    if [ -z "$cpd" ]; then
+      _fail "cleanupPeriodDays is UNSET — Claude Code defaults to 30 days and silently deletes older transcripts"
+    elif [ "$cpd" -lt 365 ] 2>/dev/null; then
+      _warn "cleanupPeriodDays = $cpd — transcripts older than that are deleted by Claude Code, not by this tool"
+    else
+      _ok "cleanupPeriodDays = $cpd"
+    fi
+    local ev hooks p found
+    for ev in SessionStart SessionEnd; do
+      hooks="$(jq -r --arg e "$ev" '.hooks[$e][]?.hooks[]?.command // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+      if [ -z "$hooks" ]; then
+        _fail "$ev: no hook wired — marked sessions will never be removed"
+        continue
+      fi
+      found=0
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        local abs; abs="$(_hook_path "$p")"
+        if [ ! -e "$abs" ];      then _fail "$ev: '$p' does not exist"
+        elif [ ! -x "$abs" ];    then _fail "$ev: '$p' is not executable"
+        else found=1; fi
+      done <<< "$hooks"
+      [ "$found" = 1 ] && _ok "$ev: $(printf '%s' "$hooks" | grep -c .) hook(s) wired and executable"
+    done
+  fi
+
+  echo "install"
+  if [ -d "$REPO_DIR" ]; then
+    local pair
+    for pair in "claude-session:$HOME/.local/bin/claude-session" \
+                "reap-sessions.sh:$HOME/.claude/hooks/reap-sessions.sh"; do
+      local src="$REPO_DIR/${pair%%:*}" dst="${pair#*:}"
+      if [ ! -f "$src" ]; then _warn "no repo copy of ${pair%%:*}"
+      elif [ ! -f "$dst" ]; then _warn "not installed: $dst"
+      elif cmp -s "$src" "$dst"; then _ok "$(basename "$dst") matches the repo copy"
+      else _fail "$(basename "$dst") DIFFERS from the repo copy — reinstall with: install -Dm755 $src $dst"; fi
+    done
+  else
+    _warn "repo not found at $REPO_DIR — skipping install-drift check"
+  fi
+
+  echo "store"
+  local n_tx n_marked stale=0 orphan_side=0 m t d
+  n_tx="$(all_ids | grep -c . || true)"
+  n_marked="$(marked_ids | grep -c . || true)"
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    [ -f "${m%.delete}" ] || stale=$((stale+1))
+  done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl.delete' 2>/dev/null)
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    case "$(basename "$d")" in memory) continue;; esac
+    [ -f "$d.jsonl" ] || orphan_side=$((orphan_side+1))
+  done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -type d 2>/dev/null)
+  _ok "$n_tx transcript(s), $n_marked marked for deletion"
+  [ "$stale" -gt 0 ] && _warn "$stale marker(s) whose transcript is already gone (harmless; cleared on next reap)"
+  [ "$orphan_side" -gt 0 ] && _warn "$orphan_side sidecar dir(s) with no transcript"
+
+  echo "safety net"
+  local tn ta; tn="$(trashed_ids | grep -c . || true)"; ta="$(archived_ids | grep -c . || true)"
+  _ok "trash: $tn session(s), TTL ${TRASH_TTL_DAYS}d ($TRASH_DIR)"
+  if [ "$ta" = 0 ]; then _warn "archive is empty — run 'claude-session archive' to keep copies outside ~/.claude/projects"
+  else _ok "archive: $ta session(s) ($ARCHIVE_DIR)"; fi
+  local unarch=0 f id proj
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    id="$(basename "$f" .jsonl)"; proj="$(basename "$(dirname "$f")")"
+    [ -f "$ARCHIVE_DIR/$proj/$id.jsonl.gz" ] || unarch=$((unarch+1))
+  done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' -mtime "+$ARCHIVE_MIN_AGE_DAYS" 2>/dev/null)
+  [ "$unarch" -gt 0 ] && _warn "$unarch transcript(s) older than ${ARCHIVE_MIN_AGE_DAYS}d not archived yet"
+  if [ -r "$LOG_FILE" ]; then _ok "tombstone log: $(grep -c . "$LOG_FILE" || true) entr(ies) ($LOG_FILE)"
+  else _warn "no tombstone log yet ($LOG_FILE)"; fi
+
+  echo "salvage"
+  if [ -r "$HISTORY_FILE" ] && have_jq; then
+    local h have orph
+    h="$(history_ids | grep -c . || true)"
+    have="$({ all_ids; trashed_ids; archived_ids; } | sort -u | grep -c . || true)"
+    orph="$(comm -23 <(history_ids) <({ all_ids; trashed_ids; archived_ids; } | sort -u) | grep -c . || true)"
+    if [ "$orph" -gt 0 ]; then
+      _warn "$orph of $h session(s) in history.jsonl have no transcript — prompts only ('claude-session orphans')"
+    else
+      _ok "all $h session(s) in history.jsonl still have a copy ($have on disk)"
+    fi
+  else
+    _warn "history.jsonl unreadable or jq missing — no prompt-level salvage available"
+  fi
+
+  echo
+  if [ "$DOC_FAIL" = 1 ]; then echo "doctor: FAILURES above — transcripts are at risk."; return 1; fi
+  echo "doctor: all good."
+  return 0
+}
+
+# --------------------------------------------------------------- dispatch ----
 
 # Dispatch only when executed directly, so helpers can be sourced for testing.
 if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
   sub="${1:-list}"; shift || true
   case "$sub" in
-    list)   cmd_list "$@";;
-    marked) cmd_marked "$@";;
-    mark)   cmd_mark "$@";;
-    unmark) cmd_unmark "$@";;
-    delete) cmd_delete "$@";;
-    reap)   cmd_reap "$@";;
+    list)     cmd_list "$@";;
+    marked)   cmd_marked "$@";;
+    mark)     cmd_mark "$@";;
+    unmark)   cmd_unmark "$@";;
+    delete)   cmd_delete "$@";;
+    reap)     cmd_reap "$@";;
+    end)      cmd_end "$@";;
+    trash)    cmd_trash "$@";;
+    restore)  cmd_restore "$@";;
+    purge)    cmd_purge "$@";;
+    archive)  cmd_archive "$@";;
+    archived) cmd_archived "$@";;
+    history)  cmd_history "$@";;
+    orphans)  cmd_orphans "$@";;
+    log)      cmd_log "$@";;
+    doctor)   cmd_doctor "$@";;
     -h|--help|help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0";;
-    *) die "unknown subcommand '$sub' (try: list mark unmark marked delete reap)";;
+    *) die "unknown subcommand '$sub' (try: list mark unmark marked delete reap trash restore purge archive archived history orphans log doctor)";;
   esac
 fi
