@@ -105,9 +105,11 @@ newer() {
 send_notification() {
   local summary="$1" body="$2"
   command -v notify-send >/dev/null 2>&1 || return 0
+  # -t 0: never expire. This is a once-a-day reminder — a banner that vanishes after a
+  # few seconds is missed unless you happen to be looking at the screen when the timer fires.
   DISPLAY="${DISPLAY:-:0}" \
   DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
-  notify-send -a "update-all" -i software-update-available "$summary" "$body" || true
+  notify-send -a "update-all" -i software-update-available -t 0 "$summary" "$body" || true
 }
 
 find_npm() {
