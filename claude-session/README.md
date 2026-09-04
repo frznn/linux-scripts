@@ -98,7 +98,9 @@ Then run `claude-session doctor` — it verifies exactly this wiring.
 ```
 claude-session list [opts]     # date · size · short-id · project · title;  [MARKED] [LIVE]
                                #   -l/--long · --marked · --live · --project <s>
-                               #   --since <date> · --limit <n>
+                               #   --since <date> · --limit <n> · --header/--no-header
+claude-session resume [opts] <id> [claude args...]   # re-enter a session from its own
+                               #   project dir;  -n/--dry-run · -f/--force
 claude-session mark [<id>]     # mark a session for deletion (default: the current session)
 claude-session unmark <id>     # remove a session's marker
 claude-session marked          # list sessions currently marked
@@ -106,11 +108,11 @@ claude-session delete [-f] [--purge] <id>...   # delete now → trash; refuses a
 claude-session reap [<cur>]    # trash every marked, non-live session (SessionStart hook)
 claude-session end <path>      # marker-gated removal of one transcript (SessionEnd hook)
 
-claude-session trash           # what's in the trash and when each entry expires
+claude-session trash           # date · size · id · project · expires · title
 claude-session restore <id>    # bring a session back (from trash, else from the archive)
 claude-session purge [--older-than <n>] [--all] [-n]    # drop expired trash
 claude-session archive [--older-than <n>] [--prune] [--auto] [-n]
-claude-session archived        # list archived sessions
+claude-session archived        # date · size · id · project · title
 
 claude-session history <id> [--oneline] [-n <n>]   # replay a session's PROMPTS from history.jsonl
 claude-session orphans         # sessions in history.jsonl with no transcript anywhere
@@ -129,6 +131,36 @@ Typical flow — mark the current session at the end and let it clean up on exit
 claude-session mark            # marks the current session ($CLAUDE_CODE_SESSION_ID)
 # ...the SessionEnd hook moves it to the trash when you exit; restorable for 30 days.
 ```
+
+## Resuming a session
+
+`claude --resume` needs the **complete** UUID *and* only finds sessions whose recorded cwd matches
+the current directory — so getting back into an old session by hand means `list -l`, copy the UUID,
+`cd` to the right project, then resume. `resume` does all three:
+
+```bash
+claude-session resume 9f9b37c8              # prefix → full UUID → cd → exec claude --resume
+claude-session resume 9f9b37c8 -n           # print the command instead of running it
+claude-session resume 9f9b37c8 --fork-session   # extra args are passed through to claude
+```
+
+The project directory comes from the transcript's own `cwd` record — never from the encoded
+directory name and never from `$PWD`. If it no longer exists, `resume` says so and stops rather than
+resuming from the wrong place. It `exec`s, so you land in the real interactive Claude Code process
+on a clean TTY, not inside a subshell of the script.
+
+It refuses a session that is **`[LIVE]`** (two clients appending to one transcript would corrupt it)
+or **`[MARKED]`** for deletion (anything you did in it would be thrown away at SessionEnd), naming
+the fix in each case; `-f`/`--force` overrides both. A prefix that matches a trashed or archived
+session points you at `restore` instead.
+
+## Column headers
+
+The tabular listings — `list`, `trash`, `archived`, `orphans`, `log` — print a dim uppercase column
+header **when stdout is a TTY**, and omit it when the output is piped or redirected, so scripted
+consumers keep seeing data rows only. `--header` / `--no-header` force it either way. `marked` is
+deliberately exempt: it stays a bare list of ids for `while read id` loops (use `list --marked` for
+the tabular view of the same set).
 
 ## Salvage: `history.jsonl` outlives the transcripts
 
@@ -169,8 +201,17 @@ only ever moves `<uuid>.jsonl`, its `.delete` marker, and the `<uuid>/` sidecar 
 
 ## Implementation notes
 
-- `list` memoises each transcript's cwd + AI title in `~/.cache/claude-session/`, keyed by
-  mtime+size — it used to re-scan every transcript with `jq` on each run.
+- Every listing resolves its project + title column through one helper (`row_meta`), so `list`,
+  `trash` and `archived` render the same way: the transcript's own `cwd` record, falling back to the
+  encoded directory name. `archived` reads the metadata straight out of the `.gz`.
+- Encoded project directories start with `-`, which unguarded tools read as an option
+  (`basename: invalid option -- 'h'`), so the directory name is taken with parameter expansion
+  (`_encdir`) rather than `basename`/`dirname`.
+- Each transcript's cwd + AI title is memoised in `~/.cache/claude-session/`, keyed by mtime+size —
+  `list` used to re-scan every transcript with `jq` on each run. The cache key is qualified by
+  location (`<id>`, `<id>.trash`, `<id>.gz`): one session id can exist as a live transcript, a
+  trashed copy *and* an archived copy at once, and a single key would let them invalidate each
+  other on every run.
 - The script deliberately does **not** use `set -o pipefail`: it is full of `… | head -1` idioms,
   and on a large transcript the upstream stage takes SIGPIPE when `head` exits early, which
   pipefail turns into a fatal 141 under `set -e` (this silently truncated `list` output partway
