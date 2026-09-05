@@ -175,7 +175,7 @@ directory called `duskyard`, and `--match frznn` matches every path under `/home
 Not every transcript carries a `cwd` record. The encoded directory name cannot be decoded back into
 a path (`-` stands for both a separator and a literal dash), but every transcript in one encoded
 directory was written from the same cwd, so a sibling that has the record supplies it. Without that,
-a cwd-less session would be invisible to `--under` and `delete --under` would silently skip it.
+a cwd-less session would be invisible to `--project` and `delete --project` would silently skip it.
 
 **Sidecars are archived alongside the transcript.** A session may have a `<uuid>/` sidecar dir
 (`tool-results/`, `subagents/`) holding tool output too large to inline. `archive` captures it as

@@ -143,7 +143,7 @@ _sidecar_tar() { printf '%s/%s/%s.sidecar.tar.gz' "$ARCHIVE_DIR" "$1" "$2"; }
 # literal dash, so '-home-frznn-dev-fed-franz-dusk' is unparseable on its own. But
 # every transcript in one encoded dir was written from the SAME cwd, so a sibling
 # that does have the record supplies it exactly. Without this a cwd-less session
-# is invisible to --under, and `delete --under` would silently skip it.
+# is invisible to --project, and `delete --project` would silently skip it.
 declare -A _DIR_CWD=()
 _DIR_CWD_BUILT=0
 _build_dir_cwd() {
