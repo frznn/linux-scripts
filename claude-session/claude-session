@@ -25,8 +25,13 @@
 #
 # Subcommands:
 #   list [opts]          sessions newest-first: date · size · short-id · project · title
-#                        -l/--long full UUIDs · --marked · --live · --project <substr>
+#                        every session, ACTIVE ones first then a dim "archived"
+#                        divider and the rest; --active lists only the active
+#                        -l/--long full UUIDs · --ids bare UUIDs · --marked · --live
+#                        --project <name|path> selects a project and every
+#                        sub-project below it · --match <substr> raw substring
 #                        --since <date> · --limit <n>
+#   projects             projects and sub-projects, with session counts
 #   resume [opts] <id>   re-enter a session: cd to the project dir recorded in its
 #                        own transcript, then exec `claude --resume <full-uuid>`
 #                        (which needs the complete id AND the matching cwd)
@@ -37,6 +42,8 @@
 #   marked               list sessions currently marked for deletion
 #   delete [opts] <id>…  delete now → trash; --purge unlinks outright (unrecoverable);
 #                        refuses a LIVE session unless -f/--force
+#                        --project <name|path> deletes a project and all its
+#                        sub-projects — refuses without --yes; -n lists the set
 #   reap   [<current>]   trash every MARKED, non-live session (SessionStart hook)
 #   end    <transcript>  marker-gated removal of one transcript (SessionEnd hook)
 #
@@ -113,6 +120,192 @@ all_ids() {
 trashed_ids() {
   [ -d "$TRASH_DIR" ] || return 0
   find "$TRASH_DIR" -mindepth 3 -maxdepth 3 -name '*.jsonl' -printf '%f\n' 2>/dev/null | sed 's/\.jsonl$//'
+}
+
+# A session's <uuid>/ sidecar dir (tool-results/, subagents/ — overflow storage
+# Claude Code writes when tool output is too big to inline) is NOT part of the
+# .jsonl, so the transcript archive alone does not preserve it. It is archived
+# beside the .gz as <uuid>.sidecar.tar.gz.
+_sidecar_tar() { printf '%s/%s/%s.sidecar.tar.gz' "$ARCHIVE_DIR" "$1" "$2"; }
+
+# ---------------------------------------------------------------- projects --
+# A session's project is its recorded cwd — a real absolute path — so projects
+# form a TREE: a session in ~/dev/fed-franz/dusk/dusk-testbed belongs to
+# dusk-testbed AND to dusk AND to fed-franz. Selectors resolve a name or path
+# fragment to ONE root path and then match on SEGMENT boundaries. That is what
+# raw substring matching gets wrong: 'frznn' is a substring of every path under
+# /home/frznn (85 of 88 sessions here), and 'apps' silently conflates
+# ~/dev/frznn/apps with the unrelated ~/dev/machine/apps. --match keeps the
+# substring behaviour for when it is actually what you want.
+
+# Not every transcript carries a cwd record (3 of 87 here). The encoded dir name
+# cannot be decoded back into a path — '-' stands for both a path separator and a
+# literal dash, so '-home-frznn-dev-fed-franz-dusk' is unparseable on its own. But
+# every transcript in one encoded dir was written from the SAME cwd, so a sibling
+# that does have the record supplies it exactly. Without this a cwd-less session
+# is invisible to --under, and `delete --under` would silently skip it.
+declare -A _DIR_CWD=()
+_DIR_CWD_BUILT=0
+_build_dir_cwd() {
+  [ "$_DIR_CWD_BUILT" = 1 ] && return 0
+  local f d
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    d="$(_encdir "$f")"
+    [ -n "${_DIR_CWD[$d]:-}" ] && continue
+    meta_for "$f"
+    [ -n "${META_CWD:-}" ] && _DIR_CWD[$d]="$META_CWD"
+  done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' 2>/dev/null)
+  _DIR_CWD_BUILT=1
+}
+
+# The project path for one transcript: its own cwd record, else a sibling's, else
+# the raw encoded dir name (which displays, but matches no path query).
+_proj_of() {
+  local f="$1" d
+  meta_for "$f"
+  if [ -n "${META_CWD:-}" ]; then printf '%s\n' "$META_CWD"; return 0; fi
+  _build_dir_cwd
+  d="$(_encdir "$f")"
+  printf '%s\n' "${_DIR_CWD[$d]:-$d}"
+}
+
+# Every session's project path, one line per session (duplicates intended).
+_cwds() {
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    _proj_of "$f"
+  done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' 2>/dev/null)
+}
+
+# Leading ~ expanded, trailing slashes stripped.
+_norm_path() {
+  local p="$1"
+  case "$p" in "~") p="$HOME";; "~/"*) p="$HOME/${p#\~/}";; esac
+  while [ "${#p}" -gt 1 ]; do case "$p" in */) p="${p%/}";; *) break;; esac; done
+  printf '%s' "$p"
+}
+
+# Is $1 at or below $2? Compared on segment boundaries, never as a substring.
+_is_under() {
+  case "$1" in
+    "$2")   return 0;;
+    "$2"/*) return 0;;
+    *)      return 1;;
+  esac
+}
+
+# Root paths a project query resolves to, deduped:
+#   absolute path     -> itself
+#   fragment with '/' -> every cwd prefix ending in that segment sequence
+#   bare name         -> every cwd prefix ending in a segment equal to it
+_project_roots() {
+  local q; q="$(_norm_path "$1")"
+  case "$q" in /*) printf '%s\n' "$q"; return 0;; esac
+  local cwd pre seg rest
+  _cwds | sort -u | while IFS= read -r cwd; do
+    case "$cwd" in /*) :;; *) continue;; esac
+    pre=""; rest="${cwd#/}"
+    while [ -n "$rest" ]; do
+      seg="${rest%%/*}"
+      pre="$pre/$seg"
+      case "$q" in
+        */*) case "$pre" in */"$q") printf '%s\n' "$pre";; esac;;
+        *)   [ "$seg" = "$q" ] && printf '%s\n' "$pre";;
+      esac
+      case "$rest" in *"/"*) rest="${rest#*/}";; *) rest="";; esac
+    done
+  done | sort -u
+}
+
+_count_under() {
+  local root="$1" cwd c=0
+  while IFS= read -r cwd; do
+    [ -n "$cwd" ] || continue
+    _is_under "$cwd" "$root" && c=$((c+1))
+  done < <(_cwds)
+  printf '%s' "$c"
+}
+
+# Resolve to exactly one project. When a name matches several and there is a
+# terminal to ask on, offer a numbered choice; otherwise keep the never-guess
+# contract and fail with the candidates listed. The non-interactive path is not
+# a fallback nicety — the hooks (reap-sessions.sh, session-end-cleanup.sh) run
+# this with stderr on /dev/null and no controlling tty, and a prompt there would
+# hang session startup forever. Returns non-zero rather than exiting, so callers
+# in $( ) see the failure; the chosen path goes to stdout, everything else to
+# stderr, which keeps `list --ids | xargs …` clean while still being promptable.
+_project_root_or_die() {
+  local q="$1" roots n r c i choice tries=0 interactive=0
+  roots="$(_project_roots "$q")"
+  n=0; [ -n "$roots" ] && n="$(printf '%s\n' "$roots" | grep -c . || true)"
+  if [ "$n" = 0 ]; then
+    echo "no project matches '$q' — try 'claude-session projects'" >&2
+    return 1
+  fi
+  [ "$n" = 1 ] && { printf '%s\n' "$roots"; return 0; }
+
+  local cand=()
+  while IFS= read -r r; do [ -n "$r" ] && cand+=("$r"); done <<EOF
+$roots
+EOF
+
+  # Only ask when stderr is a terminal AND a controlling tty can be opened for
+  # reading — stdin may legitimately be a pipe here, so the answer is read from
+  # /dev/tty, not stdin.
+  # The brace group matters: `exec 3</dev/tty 2>/dev/null` is an exec with no
+  # command, so BOTH redirections would apply permanently — silently sending
+  # every later prompt to /dev/null. Confining 2>/dev/null to the group keeps
+  # fd 3 (which does persist) without hijacking stderr.
+  if [ -t 2 ] && { exec 3</dev/tty; } 2>/dev/null; then interactive=1; fi
+
+  if [ "$interactive" != 1 ]; then
+    echo "refusing: '$q' names $n projects." >&2
+    for r in "${cand[@]}"; do
+      c="$(_count_under "$r")"
+      printf '  %-44s (%s session%s)\n' "$(short_path "$r" 44)" "$c" "$([ "$c" = 1 ] || printf s)" >&2
+    done
+    echo "Name one of them more fully (e.g. --project frznn/apps), or use --match" >&2
+    echo "for a raw substring search." >&2
+    return 1
+  fi
+
+  echo "'$q' names $n projects:" >&2
+  i=0
+  for r in "${cand[@]}"; do
+    i=$((i+1)); c="$(_count_under "$r")"
+    printf '  %2d) %-44s (%s session%s)\n' "$i" "$(short_path "$r" 44)" "$c" \
+      "$([ "$c" = 1 ] || printf s)" >&2
+  done
+  while [ "$tries" -lt 3 ]; do
+    tries=$((tries+1))
+    printf 'Which project? [1-%s, q to cancel] ' "$n" >&2
+    if ! IFS= read -r choice <&3; then echo >&2; break; fi
+    case "$choice" in
+      ''|q|Q)   echo "cancelled" >&2; exec 3<&-; return 1;;
+      *[!0-9]*) ;;
+      *)        if [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+                  exec 3<&-
+                  printf '%s\n' "${cand[$((choice-1))]}"
+                  return 0
+                fi;;
+    esac
+    echo "  not one of 1-$n" >&2
+  done
+  exec 3<&-
+  echo "cancelled — no valid choice" >&2
+  return 1
+}
+
+# Session ids in project $1 or any of its sub-projects.
+_project_ids() {
+  local root="$1" f id
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    _is_under "$(_proj_of "$f")" "$root" || continue
+    id="${f##*/}"; printf '%s\n' "${id%.jsonl}"
+  done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' 2>/dev/null)
 }
 
 archived_ids() {
@@ -324,18 +517,22 @@ trash_path() {
 # ------------------------------------------------------------------- list ----
 
 cmd_list() {
-  local long=0 only_marked=0 only_live=0 proj_filter="" since="" limit=0
+  local long=0 only_marked=0 only_live=0 only_active=0 proj_query="" match_filter="" \
+        since="" limit=0 ids_only=0 proj_root=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -l|--long)   long=1;;
+      --active)    only_active=1;;
       --marked)    only_marked=1;;
       --live)      only_live=1;;
-      --project)   proj_filter="${2:?--project needs a substring}"; shift;;
+      --project)   proj_query="${2:?--project needs a project name or path}"; shift;;
+      --match)     match_filter="${2:?--match needs a substring}"; shift;;
+      --ids)       ids_only=1;;
       --since)     since="${2:?--since needs a date}"; shift;;
       --limit)     limit="${2:?--limit needs a number}"; shift;;
       --header)    HEADER=1;;
       --no-header) HEADER=0;;
-      -h|--help)   echo "usage: claude-session list [-l] [--marked] [--live] [--project <s>] [--since <date>] [--limit <n>] [--header|--no-header]"; return 0;;
+      -h|--help)   echo "usage: claude-session list [-l] [--active] [--ids] [--marked] [--live] [--project <name|path>] [--match <substr>] [--since <date>] [--limit <n>] [--header|--no-header]"; return 0;;
       *)           die "list: unknown option '$1'";;
     esac
     shift
@@ -344,10 +541,21 @@ cmd_list() {
   if [ -n "$since" ]; then
     since_epoch="$(date -d "$since" +%s 2>/dev/null)" || die "list: unparseable --since '$since'"
   fi
+  if [ -n "$proj_query" ]; then
+    proj_root="$(_project_root_or_die "$proj_query")" || return 1
+  fi
   local marked_list live_list; marked_list="$(marked_ids)"; live_list="$(live_ids)"
   local idw=8
   if [ "$long" = 1 ]; then idw=36; fi
-  local n=0 epoch when bytes f id show flags
+
+  # Every session is listed; archived ones simply come last. "Archived" is the
+  # same currency test cmd_archive uses (.gz newer than the transcript), so a
+  # transcript that grew after it was archived counts as ACTIVE — it is not
+  # actually covered — as does any LIVE session (see below).
+  # Rows are buffered rather than printed as they are found, because the source
+  # is one mtime-sorted stream and the two blocks have to come out in order.
+  local act=() arc=() aid=() rid=()
+  local epoch when bytes f id show flags gz line
   while IFS=$'\t' read -r epoch when bytes f; do
     [ -n "${f:-}" ] || continue
     id="$(basename "$f" .jsonl)"
@@ -358,17 +566,119 @@ cmd_list() {
     [ "$only_marked" = 1 ] && case "$flags" in *MARKED*) :;; *) continue;; esac
     [ "$only_live"   = 1 ] && case "$flags" in *LIVE*)   :;; *) continue;; esac
     row_meta "$f" "$(_encdir "$f")"
-    if [ -n "$proj_filter" ]; then case "$ROW_PROJ" in *"$proj_filter"*) :;; *) continue;; esac; fi
+    if [ -n "$proj_root" ]; then
+      _is_under "$(_proj_of "$f")" "$proj_root" || continue
+    fi
+    if [ -n "$match_filter" ]; then case "$ROW_PROJ" in *"$match_filter"*) :;; *) continue;; esac; fi
+
+    gz="$ARCHIVE_DIR/$(_encdir "$f")/$id.jsonl.gz"
+    local archived=0
+    if [ -f "$gz" ] && [ "$gz" -nt "$f" ]; then archived=1; fi
+    # A LIVE session is active whatever the mtimes say. An idle one can pass the
+    # currency test — its transcript has not grown since the last sweep — but it
+    # will invalidate that copy the moment it writes again, and showing a running
+    # session under "archived" reads as finished when it is not.
+    case "$flags" in *LIVE*) archived=0;; esac
+    [ "$only_active" = 1 ] && [ "$archived" = 1 ] && continue
+
     if [ "$long" = 1 ]; then show="$id"; else show="${id%%-*}"; fi
-    if [ "$n" = 0 ]; then hdr '%-16s  %6s  %-*s  %-26s  %s' DATE SIZE "$idw" ID PROJECT TITLE; fi
-    printf '%s  %6s  %-*s  %-26s  %s%s\n' \
-      "$when" "$(hsize "$bytes")" "$idw" "$show" \
-      "$(short_path "$ROW_PROJ" 26)" "$ROW_TITLE" "$flags"
-    n=$((n+1))
-    [ "$limit" != 0 ] && [ "$n" -ge "$limit" ] && break
+    line="$(printf '%s  %6s  %-*s  %-26s  %s%s' \
+              "$when" "$(hsize "$bytes")" "$idw" "$show" \
+              "$(short_path "$ROW_PROJ" 26)" "$ROW_TITLE" "$flags")"
+    if [ "$archived" = 1 ]; then arc+=("$line"); rid+=("$id")
+    else                        act+=("$line"); aid+=("$id"); fi
   done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' \
              -printf '%T@\t%TY-%Tm-%Td %TH:%TM\t%s\t%p\n' 2>/dev/null | sort -rn)
-  [ "$n" = 0 ] && echo "(no sessions match)"
+
+  local na=${#act[@]} nr=${#arc[@]} n=0
+  if [ "$ids_only" = 1 ]; then
+    for id in ${aid+"${aid[@]}"} ${rid+"${rid[@]}"}; do
+      printf '%s\n' "$id"; n=$((n+1))
+      [ "$limit" != 0 ] && [ "$n" -ge "$limit" ] && break
+    done
+    return 0
+  fi
+  if [ "$((na + nr))" = 0 ]; then echo "(no sessions match)"; return 0; fi
+
+  hdr '%-16s  %6s  %-*s  %-26s  %s' DATE SIZE "$idw" ID PROJECT TITLE
+  for line in ${act+"${act[@]}"}; do
+    printf '%s\n' "$line"; n=$((n+1))
+    [ "$limit" != 0 ] && [ "$n" -ge "$limit" ] && { return 0; }
+  done
+  [ "$nr" = 0 ] && return 0
+  # The divider counts the rows that actually follow, not the whole archived set:
+  # under --limit it would otherwise announce 80 and then print two.
+  local show_nr=$nr rem
+  if [ "$limit" != 0 ]; then
+    rem=$((limit - n)); [ "$rem" -lt 0 ] && rem=0
+    [ "$show_nr" -gt "$rem" ] && show_nr=$rem
+  fi
+  [ "$show_nr" = 0 ] && return 0
+  if [ "$show_nr" -lt "$nr" ]; then hdr '── archived (%s of %s) ──' "$show_nr" "$nr"
+  else                              hdr '── archived (%s) ──' "$nr"; fi
+  for line in ${arc+"${arc[@]}"}; do
+    printf '%s\n' "$line"; n=$((n+1))
+    [ "$limit" != 0 ] && [ "$n" -ge "$limit" ] && break
+  done
+  return 0
+}
+
+cmd_projects() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --header)    HEADER=1;;
+      --no-header) HEADER=0;;
+      -h|--help)   echo "usage: claude-session projects [--header|--no-header]"; return 0;;
+      *)           die "projects: unknown option '$1'";;
+    esac
+    shift
+  done
+  local cwds; cwds="$(_cwds)"
+  [ -n "$cwds" ] || { echo "(no sessions)"; return 0; }
+  # SESSIONS = sessions in this project itself ('-' when it only holds sub-projects)
+  # TOTAL    = it plus every sub-project — the number `--project <it>` selects.
+  # A project is listed when it holds sessions or branches into >=2 sub-projects,
+  # so pass-through directories collapse into their child's name instead of
+  # padding the tree with levels you can never usefully name.
+  local depth label own tot n=0 indent i disp
+  while IFS="$(printf '\t')" read -r depth label own tot; do
+    [ -n "$label" ] || continue
+    if [ "$n" = 0 ]; then hdr '%8s  %6s  %s' SESSIONS TOTAL PROJECT; fi
+    indent=""; i=0
+    while [ "$i" -lt "$depth" ]; do indent="$indent  "; i=$((i+1)); done
+    disp="$label"; [ "$depth" = 0 ] && disp="$(short_path "$label" 48)"
+    printf '%8s  %6s  %s%s\n' "$own" "$tot" "$indent" "$disp"
+    n=$((n+1))
+  done < <(printf '%s\n' "$cwds" | awk '
+    {
+      own[$0]++
+      n = split($0, seg, "/")
+      pre = ""
+      for (i = 2; i <= n; i++) { pre = pre "/" seg[i]; total[pre]++; node[pre] = 1 }
+    }
+    END {
+      for (p in node) {
+        par = p; sub(/\/[^\/]*$/, "", par); if (par == "") par = "/"
+        nchild[par]++
+      }
+      m = 0
+      for (p in node)
+        if (p != "/" && (own[p] > 0 || nchild[p] >= 2)) shown[++m] = p
+      # lexicographic order puts every project ahead of its sub-projects, which
+      # is what lets the stack below find each ones nearest listed parent.
+      for (i = 1; i <= m; i++)
+        for (j = i + 1; j <= m; j++)
+          if (shown[j] < shown[i]) { t = shown[i]; shown[i] = shown[j]; shown[j] = t }
+      sp = 0
+      for (i = 1; i <= m; i++) {
+        p = shown[i]
+        while (sp > 0 && index(p, stack[sp] "/") != 1) sp--
+        label = (sp > 0) ? substr(p, length(stack[sp]) + 2) : p
+        printf "%s\t%s\t%s\t%s\n", sp, label, (own[p] ? own[p] : "-"), total[p]
+        stack[++sp] = p
+      }
+    }')
+  [ "$n" = 0 ] && echo "(no sessions)"
   return 0
 }
 
@@ -407,17 +717,54 @@ cmd_unmark() {
 }
 
 cmd_delete() {
-  local force=0 purge=0
+  local force=0 purge=0 proj_q="" yes=0 dry=0 root="" ids="" nid=0 nsub=0 c sub_txt=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -f|--force) force=1;;
       --purge)    purge=1;;
+      --project)  proj_q="${2:?--project needs a project name or path}"; shift;;
+      --yes)      yes=1;;
+      -n|--dry-run) dry=1;;
       -*)         die "delete: unknown option '$1'";;
       *)          break;;
     esac
     shift
   done
-  [ "$#" -ge 1 ] || die "usage: claude-session delete [-f] [--purge] <id> [id...]"
+
+  # Deleting a project takes its sub-projects with it, and unlike the <id> form
+  # there is no explicit list acting as its own confirmation — so it is gated:
+  # refuse and state the blast radius unless --yes, with -n to see the exact set.
+  if [ -n "$proj_q" ]; then
+    [ "$#" = 0 ] || die "delete: --project takes no <id> arguments"
+    root="$(_project_root_or_die "$proj_q")" || return 1
+    ids="$(_project_ids "$root")"
+    [ -n "$ids" ] && nid="$(printf '%s\n' "$ids" | grep -c .)"
+    [ "$nid" = 0 ] && { echo "project $(short_path "$root" 60) has no sessions"; return 0; }
+    # Sub-projects are the distinct project paths strictly below the root — the
+    # root's own sessions do not make it a sub-project of itself.
+    nsub="$({ while IFS= read -r c; do
+                [ -n "$c" ] || continue
+                [ "$c" = "$root" ] && continue
+                _is_under "$c" "$root" && printf '%s\n' "$c"
+              done < <(_cwds); } | sort -u | grep -c . || true)"
+    [ "$nsub" -gt 0 ] && sub_txt=" across $nsub sub-project(s)"
+    if [ "$dry" = 1 ]; then
+      echo "would delete project $(short_path "$root" 60): $nid session(s)$sub_txt"
+      # Pass the RESOLVED path, not the original query: an absolute path can only
+      # name one project, so the dry-run listing never re-asks what was just answered.
+      cmd_list --project "$root" --header
+      return 0
+    fi
+    if [ "$yes" != 1 ]; then
+      echo "refusing: project $(short_path "$root" 60) holds $nid session(s)$sub_txt." >&2
+      echo "Re-run with --yes to delete it, or -n to list what it would take." >&2
+      return 1
+    fi
+    set -- $ids
+  fi
+
+  [ "$#" -ge 1 ] || die "usage: claude-session delete [-f] [--purge] <id> [id...]
+   or: claude-session delete --project <name|path> [--yes|-n] [-f] [--purge]"
   local live; live="$(live_ids)"
   local q id rc t err=0
   for q in "$@"; do
@@ -628,9 +975,18 @@ cmd_restore() {
   [ -e "$dest" ] && die "a transcript already exists at $dest — not overwriting"
   mkdir -p "$dest_dir"
   gunzip -c -- "$src" > "$dest.part" && mv -f -- "$dest.part" "$dest"
+  local tar="$(_sidecar_tar "$proj" "$id")" side_note=""
+  if [ -f "$tar" ] && [ ! -d "$dest_dir/$id" ]; then
+    if mkdir -p "$dest_dir/$id" && tar -xzf "$tar" -C "$dest_dir/$id" 2>/dev/null; then
+      side_note=" (+sidecar)"
+    else
+      rmdir "$dest_dir/$id" 2>/dev/null || true
+      echo "warning: sidecar tarball present but could not be unpacked: $tar" >&2
+    fi
+  fi
   log_event restore "$id" "$proj" "$(stat -c %s "$dest" 2>/dev/null || echo 0)" \
     "$(prompt_count "$id")" archive ""
-  echo "restored from archive: $id → $dest"
+  echo "restored from archive: $id → $dest$side_note"
 }
 
 _restorable_ids() { { trashed_ids; archived_ids; } | sort -u; }
@@ -690,20 +1046,67 @@ cmd_archive() {
     esac
     shift
   done
-  local f id proj gz n=0
+  local f id proj gz side tar n=0 np=0 need_j need_s what sfx
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     id="$(basename "$f" .jsonl)"; proj="$(basename "$(dirname "$f")")"
     gz="$ARCHIVE_DIR/$proj/$id.jsonl.gz"
-    [ -f "$gz" ] && [ "$gz" -nt "$f" ] && continue          # already archived, unchanged since
-    if [ "$dry" = 1 ]; then echo "would archive: ${id%%-*}  $proj"; n=$((n+1)); continue; fi
-    mkdir -p "$ARCHIVE_DIR/$proj" || continue
-    gzip -c -- "$f" > "$gz.part" 2>/dev/null && mv -f -- "$gz.part" "$gz" || { rm -f -- "$gz.part"; continue; }
-    n=$((n+1))
-    [ "$quiet" = 1 ] || echo "archived: ${id%%-*}  →  $gz"
-    if [ "$prune" = 1 ]; then trash_path "$f" archive-prune || true; fi
+    side="${f%.jsonl}"; tar="$(_sidecar_tar "$proj" "$id")"
+
+    # Two independent pieces, each with its own currency test. A sidecar can gain
+    # files while the transcript is untouched, so testing only the .jsonl would
+    # leave the tarball permanently stale.
+    need_j=1; [ -f "$gz" ] && [ "$gz" -nt "$f" ] && need_j=0
+    need_s=0
+    if [ -d "$side" ]; then
+      if [ ! -f "$tar" ]; then need_s=1
+      elif [ -n "$(find "$side" -newer "$tar" -print -quit 2>/dev/null)" ]; then need_s=1; fi
+    fi
+
+    if [ "$need_j" = 1 ] || [ "$need_s" = 1 ]; then
+      what="transcript"; [ "$need_j" = 0 ] && what="sidecar"
+      [ "$need_j" = 1 ] && [ "$need_s" = 1 ] && what="transcript+sidecar"
+      if [ "$dry" = 1 ]; then
+        echo "would archive: ${id%%-*}  $proj  ($what)"; n=$((n+1))
+      else
+        mkdir -p "$ARCHIVE_DIR/$proj" || continue
+        if [ "$need_j" = 1 ]; then
+          gzip -c -- "$f" > "$gz.part" 2>/dev/null && mv -f -- "$gz.part" "$gz" \
+            || { rm -f -- "$gz.part"; continue; }
+        fi
+        if [ "$need_s" = 1 ]; then
+          # -C "$side" . stores paths relative to the sidecar itself, so restore
+          # can unpack into a freshly made <uuid>/ without trusting a stored name.
+          if tar -czf "$tar.part" -C "$side" . 2>/dev/null; then
+            mv -f -- "$tar.part" "$tar"
+          else
+            rm -f -- "$tar.part"
+            echo "warning: could not archive sidecar for ${id%%-*} — not pruning it" >&2
+            continue
+          fi
+        fi
+        n=$((n+1))
+        sfx=""; [ "$need_s" = 1 ] && sfx=" (+sidecar)"
+        [ "$quiet" = 1 ] || echo "archived: ${id%%-*}  →  $gz$sfx"
+      fi
+    fi
+
+    # --prune removes the original once a copy exists. It has to fire for a
+    # session archived on an EARLIER run too: on a steady-state store everything
+    # is already covered, so gating prune on "archived something just now" made
+    # `archive --prune` a silent no-op. Never reached when archiving failed above.
+    if [ "$prune" = 1 ]; then
+      if [ "$dry" = 1 ]; then echo "would prune: ${id%%-*}  $proj"; np=$((np+1))
+      elif trash_path "$f" archive-prune; then np=$((np+1)); fi
+    fi
   done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' -mtime "+$older" 2>/dev/null)
-  if [ "$quiet" != 1 ] && [ "$n" = 0 ]; then echo "(nothing to archive)"; fi
+  if [ "$quiet" != 1 ]; then
+    if [ "$np" -gt 0 ]; then
+      if [ "$dry" = 1 ]; then echo "would prune $np original(s) to the trash"
+      else echo "pruned $np original(s) to the trash"; fi
+    fi
+    [ "$n" = 0 ] && [ "$np" = 0 ] && echo "(nothing to archive)"
+  fi
   return 0
 }
 
@@ -852,6 +1255,22 @@ _fail() { printf '  %sFAIL%s  %s\n' "$C_R" "$C_0" "$*"; DOC_FAIL=1; }
 # Expand a leading ~ and take the command word out of a hook command string.
 _hook_path() { local c="${1:-}"; c="${c%% *}"; case "$c" in "~"*) c="$HOME${c#\~}";; esac; printf '%s' "$c"; }
 
+# Compare one repo file against the copy that is actually in use.
+#   _drift <repo file> <in-use file> <install|reconcile> [label]
+# "install" prescribes a direction: the repo is upstream of that path by
+# definition, because this README is what puts the file there. "reconcile" stays
+# direction-neutral — a hook may be canonical somewhere else and this copy the
+# derived one, so report the divergence and let a human decide which way it goes.
+_drift() {
+  local src="$1" dst="$2" mode="$3" label="${4:-${2##*/}}"
+  if [ ! -f "$src" ];             then _warn "no repo copy of ${src##*/}"
+  elif [ ! -f "$dst" ];           then _warn "not installed: $dst"
+  elif cmp -s "$src" "$dst";      then _ok   "$label matches the repo copy"
+  elif [ "$mode" = install ];     then _fail "$label DIFFERS from the repo copy — reinstall with: install -Dm755 $src $dst"
+  else                                 _fail "$label DIFFERS from the repo copy — reconcile: diff $src $dst"
+  fi
+}
+
 cmd_doctor() {
   echo "settings ($SETTINGS_FILE)"
   if [ ! -r "$SETTINGS_FILE" ]; then
@@ -887,18 +1306,36 @@ cmd_doctor() {
   fi
 
   echo "install"
-  if [ -d "$REPO_DIR" ]; then
-    local pair
-    for pair in "claude-session:$HOME/.local/bin/claude-session" \
-                "reap-sessions.sh:$HOME/.claude/hooks/reap-sessions.sh"; do
-      local src="$REPO_DIR/${pair%%:*}" dst="${pair#*:}"
-      if [ ! -f "$src" ]; then _warn "no repo copy of ${pair%%:*}"
-      elif [ ! -f "$dst" ]; then _warn "not installed: $dst"
-      elif cmp -s "$src" "$dst"; then _ok "$(basename "$dst") matches the repo copy"
-      else _fail "$(basename "$dst") DIFFERS from the repo copy — reinstall with: install -Dm755 $src $dst"; fi
-    done
-  else
+  if [ ! -d "$REPO_DIR" ]; then
     _warn "repo not found at $REPO_DIR — skipping install-drift check"
+  else
+    # The CLI has exactly one install path, so check it directly.
+    _drift "$REPO_DIR/claude-session" "$HOME/.local/bin/claude-session" install claude-session
+
+    # Hooks are NOT checked at a fixed path. A hook can live anywhere; what
+    # decides which copy actually runs is settings.json. So drift-check whatever
+    # is wired there, pairing each wired command with a repo script of the same
+    # name — a wired hook with no counterpart in the repo belongs to something
+    # else and is left alone. This is what keeps the check honest on a machine
+    # that installs a hook outside ~/.claude/hooks.
+    if ! have_jq || [ ! -r "$SETTINGS_FILE" ]; then
+      _warn "settings unreadable or jq missing — wired hooks not drift-checked"
+    else
+      local ev cmdline abs hsrc n_hooks=0
+      for ev in SessionStart SessionEnd; do
+        while IFS= read -r cmdline; do
+          [ -n "$cmdline" ] || continue
+          abs="$(_hook_path "$cmdline")"
+          hsrc="$REPO_DIR/${abs##*/}"
+          [ -f "$hsrc" ] || continue
+          n_hooks=$((n_hooks+1))
+          _drift "$hsrc" "$abs" reconcile "${abs##*/} (wired $ev)"
+        done <<< "$(jq -r --arg e "$ev" '.hooks[$e][]?.hooks[]?.command // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+      done
+      if [ "$n_hooks" = 0 ]; then
+        _warn "no wired hook matches a script in $REPO_DIR — hook drift not checked"
+      fi
+    fi
   fi
 
   echo "store"
@@ -930,6 +1367,18 @@ cmd_doctor() {
     [ -f "$ARCHIVE_DIR/$proj/$id.jsonl.gz" ] || unarch=$((unarch+1))
   done < <(find "$PROJECTS_DIR" -maxdepth 2 -name '*.jsonl' -mtime "+$ARCHIVE_MIN_AGE_DAYS" 2>/dev/null)
   [ "$unarch" -gt 0 ] && _warn "$unarch transcript(s) older than ${ARCHIVE_MIN_AGE_DAYS}d not archived yet"
+  local nside=0 unside=0 sd sid sproj
+  while IFS= read -r sd; do
+    [ -n "$sd" ] || continue
+    sid="$(basename "$sd")"; sproj="$(basename "$(dirname "$sd")")"
+    [ -f "$PROJECTS_DIR/$sproj/$sid.jsonl" ] || continue      # orphan sidecar: reported above
+    nside=$((nside+1))
+    [ -f "$(_sidecar_tar "$sproj" "$sid")" ] || unside=$((unside+1))
+  done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -type d ! -name memory 2>/dev/null)
+  if [ "$nside" = 0 ]; then :
+  elif [ "$unside" -gt 0 ]; then
+    _warn "$unside of $nside sidecar dir(s) not archived — 'archive' captures them as <id>.sidecar.tar.gz; prune before that loses them at trash expiry"
+  else _ok "sidecars: $nside/$nside archived"; fi
   if [ -r "$LOG_FILE" ]; then _ok "tombstone log: $(grep -c . "$LOG_FILE" || true) entr(ies) ($LOG_FILE)"
   else _warn "no tombstone log yet ($LOG_FILE)"; fi
 
@@ -961,6 +1410,7 @@ if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
   sub="${1:-list}"; shift || true
   case "$sub" in
     list)     cmd_list "$@";;
+    projects) cmd_projects "$@";;
     marked)   cmd_marked "$@";;
     mark)     cmd_mark "$@";;
     unmark)   cmd_unmark "$@";;

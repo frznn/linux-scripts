@@ -55,8 +55,7 @@ Only `delete --purge` unlinks outright, with no way back.
 - **`session-end-cleanup.sh`** — the SessionEnd hook → `~/.claude/hooks`. It delegates the actual
   removal to `claude-session end`, so all three deletion paths share one implementation (trash +
   tombstone). If the CLI isn't installed it falls back to a plain unlink, so a marker is still
-  honoured. *(On the author's machine the canonical copy lives in a separate workspace; install
-  this copy if you don't have your own.)*
+  honoured.
 
 ## Dependencies
 
@@ -91,13 +90,23 @@ Register both hooks in `~/.claude/settings.json` (merge into any existing `hooks
 ```
 
 Both hooks are silent and always exit 0, so they never block startup/shutdown or pollute context.
-Then run `claude-session doctor` — it verifies exactly this wiring.
+Then run `claude-session doctor` — it verifies exactly this: the setting, both hooks, and that the
+installed CLI and hook scripts still match the copies here.
+
+**Hooks may live anywhere.** `~/.claude/hooks/` is only a convention; what decides which copy
+actually runs is the path in `settings.json`. So if you already keep hook scripts somewhere else — a
+dotfiles repo, a shared workspace — install them there and wire that path instead. `doctor` reads
+the wiring rather than assuming a location: it pairs each wired command with the script of the same
+name in this directory, so a hook outside `~/.claude/hooks` is drift-checked exactly like one
+inside it, and a wired hook with no counterpart here is somebody else's and is left alone.
 
 ## Usage
 
 ```
 claude-session list [opts]     # date · size · short-id · project · title;  [MARKED] [LIVE]
-                               #   -l/--long · --marked · --live · --project <s>
+                               #   ALL sessions: active first, then archived
+                               #   -l/--long · --active · --ids · --marked · --live
+                               #   --project <name|path> · --match <substr>
                                #   --since <date> · --limit <n> · --header/--no-header
 claude-session resume [opts] <id> [claude args...]   # re-enter a session from its own
                                #   project dir;  -n/--dry-run · -f/--force
@@ -119,6 +128,65 @@ claude-session orphans         # sessions in history.jsonl with no transcript an
 claude-session log [-n <n>]    # the tombstone log: what was removed, when, by which path
 claude-session doctor          # audit the invariants that keep transcripts alive
 ```
+
+**`list` shows everything, active first then archived.** Once `archive --auto` has been running a
+while, almost everything older than a day has a `.gz` copy, so archive state is what separates the
+sessions you are still working in from the long tail behind them. `list` prints the active ones,
+then a dim `── archived (n) ──` divider, then the rest — both blocks newest-first. `--active` lists
+only the first block.
+
+A session counts as archived only when its copy is **current** — the same
+`.gz`-newer-than-transcript test `archive` itself uses — so one that grew after being archived is
+listed as active, because it is not actually covered. A `[LIVE]` session is always active whatever
+the mtimes say: an idle one can pass the currency test, but it invalidates that copy the moment it
+writes again. Archiving **copies**, so an archived session is still on disk, still resumable, still
+counted by `cleanupPeriodDays` — archived means backed up, not gone.
+
+The divider goes through the same TTY gate as the column header, so piped output stays a plain row
+stream; under `--limit` it counts the rows that actually follow (`── archived (2 of 80) ──`).
+
+**Projects and sub-projects.** A session's project is its recorded `cwd` — a real absolute path —
+so projects nest: a session in `~/dev/fed-franz/dusk/dusk-testbed` is in the `dusk-testbed`
+project, which is a sub-project of `dusk`, which is a sub-project of `fed-franz`. Selecting a
+project always includes its sub-projects.
+
+```
+claude-session projects                     # the hierarchy, SESSIONS + TOTAL per project
+claude-session list --project dusk          # dusk and every sub-project
+claude-session delete --project dusk -n     # exactly what that would take
+claude-session delete --project dusk --yes  # delete the project
+claude-session list --project dusk --ids    # bare UUIDs, for your own commands
+```
+
+`SESSIONS` counts sessions in the project itself (`-` when it only holds sub-projects); `TOTAL`
+counts it plus every sub-project, i.e. what `--project` selects. A project is listed when it holds
+sessions or branches into two or more sub-projects, so pass-through directories collapse into their
+child's name rather than padding the tree with levels you could never usefully name.
+
+A name that matches two or more projects is **asked about, never guessed**: you get a numbered
+list and pick one. With no terminal to ask on — which is how the hooks run it, stderr on
+`/dev/null` and no controlling tty — it falls back to listing the candidates and failing, because a
+prompt there would hang session startup. The answer is read from `/dev/tty`, not stdin, so
+disambiguation still works inside a pipeline, and every prompt goes to stderr so `--ids` output
+stays clean. The old raw substring behaviour is
+still available as `--match`, and it is genuinely different: `--match dusk` also matches a sibling
+directory called `duskyard`, and `--match frznn` matches every path under `/home/frznn`.
+
+Not every transcript carries a `cwd` record. The encoded directory name cannot be decoded back into
+a path (`-` stands for both a separator and a literal dash), but every transcript in one encoded
+directory was written from the same cwd, so a sibling that has the record supplies it. Without that,
+a cwd-less session would be invisible to `--under` and `delete --under` would silently skip it.
+
+**Sidecars are archived alongside the transcript.** A session may have a `<uuid>/` sidecar dir
+(`tool-results/`, `subagents/`) holding tool output too large to inline. `archive` captures it as
+`<uuid>.sidecar.tar.gz` next to the `.gz`, and `restore` unpacks it back; the two pieces have
+independent currency tests, since a sidecar can gain files while the transcript is untouched.
+Without this, `--prune` degraded a session from complete to transcript-only once its trash copy
+expired 30 days later. `doctor` reports `sidecars: N/N archived`.
+
+**`--prune` works on already-archived sessions.** It removes the original once a copy exists,
+rather than only for sessions archived in that same run — which made it a silent no-op on a store
+`archive --auto` had already covered.
 
 **Short ids / prefixes.** `list` shows the short id (the UUID's first block, e.g. `6684d991`).
 Anywhere an `<id>` is expected you may pass a full UUID *or any unambiguous prefix* (git-style). An
