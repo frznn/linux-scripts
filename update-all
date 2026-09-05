@@ -513,6 +513,7 @@ apply_npm() {
 #   comm -23 <(dpkg-query -W -f='${Package}\n' | sort) \
 #            <(apt-cache dumpavail | awk '/^Package: /{print $2}' | sort -u)
 PROTON_FEED="https://proton.me/download/mail/linux/version.json"
+PROTON_CONFIG="$HOME/.config/Proton Mail/config.json"
 
 find_update_discord() {
   local c
@@ -522,24 +523,70 @@ find_update_discord() {
   return 1
 }
 
-proton_feed() {  # → version <tab> url <tab> sha512   (stable channel)
+# Which releases THIS install is entitled to, read from the app's own config
+# rather than assumed. The feed carries three interleaved channels and the app
+# picks by `settings.releaseCategory`; a box switched to EarlyAccess is offered
+# builds a Stable-only check can never see, and then nags in-app about an update
+# this script keeps reporting as absent (1.13.4 vs 1.14.0, seen 2026-09-05).
+# Each channel also accepts everything more conservative than itself, the way
+# the app does. Config missing or unreadable → assume Stable, the old behaviour.
+proton_channels() {
+  local cat=Stable
+  [[ -r "$PROTON_CONFIG" ]] && command -v jq >/dev/null 2>&1 \
+    && cat=$(jq -r '.settings.releaseCategory // "Stable"' "$PROTON_CONFIG" 2>/dev/null)
+  case "$cat" in
+    Alpha)       echo 'Stable EarlyAccess Alpha' ;;
+    EarlyAccess) echo 'Stable EarlyAccess' ;;
+    *)           echo 'Stable' ;;
+  esac
+}
+
+# This install's fixed slot in a staged rollout (`appID.distribution`, 0–1). The
+# app offers a release only once its RolloutProportion has reached that slot, so
+# honouring it keeps this report in step with what the app will actually do
+# instead of nagging daily about a build still being staged. Unknown → 0, which
+# gates nothing: better to report early than to hide an update.
+proton_distribution() {
+  local d=''
+  [[ -r "$PROTON_CONFIG" ]] && command -v jq >/dev/null 2>&1 \
+    && d=$(jq -r '.appID.distribution // empty' "$PROTON_CONFIG" 2>/dev/null)
+  [[ "$d" =~ ^(0|1)(\.[0-9]+)?$ ]] || d=0
+  echo "$d"
+}
+
+proton_feed() {  # → version <tab> url <tab> sha512   (newest release this install is offered)
   command -v jq >/dev/null 2>&1 || return 1
-  timeout "$NET_TIMEOUT" curl -fsSL "$PROTON_FEED" 2>/dev/null \
-    | jq -r '[.Releases[] | select(.CategoryName=="Stable")][0]
-             | [.Version, (.File[] | select(.Identifier | test("deb")) | .Url, .Sha512CheckSum)]
-             | @tsv' 2>/dev/null
+  local cats dist ver url sha best_v='' best_line=''
+  cats=$(proton_channels); dist=$(proton_distribution)
+  # The feed is not sorted by version, and the channels interleave — so collect
+  # every eligible release and pick the highest with dpkg's own comparison.
+  while IFS=$'\t' read -r ver url sha; do
+    [[ -n "$ver" && -n "$url" ]] || continue
+    if [[ -z "$best_v" ]] || dpkg --compare-versions "$best_v" lt "$ver"; then
+      best_v="$ver"; best_line=$(printf '%s\t%s\t%s' "$ver" "$url" "$sha")
+    fi
+  done < <(timeout "$NET_TIMEOUT" curl -fsSL "$PROTON_FEED" 2>/dev/null \
+    | jq -r --arg cats "$cats" --argjson dist "$dist" '
+        .Releases[]
+        | select(.CategoryName as $c | ($cats | split(" ")) | index($c))
+        | select((.RolloutProportion // 1) >= $dist)
+        | [.Version, (.File[] | select(.Identifier | test("deb")) | .Url, .Sha512CheckSum)]
+        | @tsv' 2>/dev/null)
+  [[ -n "$best_line" ]] && printf '%s\n' "$best_line"
 }
 
 deb_pending() {
-  local have want ud
+  local have want ud chan
   if ud=$(find_update_discord); then
     timeout "$NET_TIMEOUT" "$ud" --check --no-notify 2>/dev/null \
       | sed -nE 's/^Update available: (\S+) -> (\S+)$/discord  \1 → \2/p'
   fi
   if have=$(dpkg-query -W -f='${Version}' proton-mail 2>/dev/null); then
     want=$(proton_feed | cut -f1)
+    chan=$(proton_channels); chan="${chan##* }"   # the widest channel in play
     [[ -n "$want" ]] && dpkg --compare-versions "$have" lt "$want" \
-      && printf 'proton-mail  %s → %s\n' "$have" "$want"
+      && printf 'proton-mail  %s → %s%s\n' "$have" "$want" \
+         "$([[ "$chan" == Stable ]] || echo " ($chan channel)")"
   fi
 }
 
