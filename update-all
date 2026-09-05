@@ -16,6 +16,7 @@
 #   update-all --notify         # check + desktop notification (names what is pending)
 #   update-all --full           # don't truncate long package lists
 #   update-all --only-new       # with --notify: notify only if the pending set changed
+#   update-all --no-action      # with --notify: don't arm the click-to-run action
 #
 #   Sources: apt  flatpak  npm  deb  standalone   (default: all)
 #
@@ -33,6 +34,12 @@
 #     Applying runs `sudo apt-get update` first, so an apply is never stale.
 #   * npm targets are ENGINE-AWARE: the newest version whose engines.node your
 #     node actually satisfies, not blindly @latest (node 20 cannot run npm 12).
+#   * The --notify notification is CLICKABLE: clicking its body runs update-all
+#     in a terminal, where the usual prompt then decides what gets applied.
+#     Dismissing it with the X applies nothing. See send_notification().
+#   * The notification collapses families that share a '-'-delimited prefix
+#     ("cosmic-panel", "cosmic-comp", ... -> "cosmic-* x7") so one big family
+#     cannot push every other name past the "+N more" cut. See group_names().
 #
 # INSTALL AS A DAILY CHECK (user systemd timer — no root needed):
 #   see update-all.timer / update-all.service in ~/.config/systemd/user/
@@ -46,6 +53,13 @@ ONLY_NEW=false
 SOURCES=()
 MAXLIST=10
 NOTIFY_MAXNAMES=5   # names listed per source in the desktop notification
+NOTIFY_GROUP_MIN=2  # collapse this many names sharing a '-' prefix into "prefix-* xN" (0/1 = off)
+NOTIFY_ACTION=true  # arm the click-to-run action on the notification
+NOTIFY_ACTION_TTL=23h        # how long the process listening for that click stays alive
+NOTIFY_UNIT=update-all-notify   # transient user unit it lives in
+# Terminal the click action opens. It must take the command to run as trailing
+# arguments; the value is word-split on purpose so flags can be included.
+UPDATE_ALL_TERMINAL="${UPDATE_ALL_TERMINAL:-cosmic-term --}"
 ALL_SOURCES=(apt flatpak npm deb standalone)
 # ESSENTIALS: one name per line, '#' comments, blank lines ignored. Globs work
 # ('linux-*'), matching is case-insensitive, and 'source:name' restricts an
@@ -63,7 +77,13 @@ for arg in "$@"; do
     --notify)          NOTIFY=true ;;
     --full)            FULL=true ;;
     --only-new)        ONLY_NEW=true ;;
-    -h|--help)         sed -n '2,45p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    --no-action)       NOTIFY_ACTION=false ;;
+    # print the header comment block, stopping at the first line of code — a
+    # fixed line range silently starts leaking `set -uo pipefail` the moment
+    # anything above it grows. The rule lines are matched as "# <punctuation
+    # only>" rather than /^# ─+$/: awk here is mawk, which counts BYTES, so the
+    # + would bind to the last byte of the 3-byte ─ and never match.
+    -h|--help)         awk 'NR==1{next} /^#/{ if ($0 ~ /^# [^a-zA-Z0-9]+$/) next; sub(/^# ?/,""); print; next } {exit}' "$0"; exit 0 ;;
     apt|flatpak|npm|deb|standalone) SOURCES+=("$arg") ;;
     *) echo "update-all: unknown argument '$arg' (try --help)" >&2; exit 1 ;;
   esac
@@ -152,15 +172,43 @@ src_names() {  # src_names <source> <essential|rest> → one name per line
   return 0
 }
 
+group_names() {  # stdin: one name per line → one "<count><TAB><display>" line per entry
+  # Names sharing their first '-'-delimited token collapse into a single entry
+  # (cosmic-panel, cosmic-comp, … → "cosmic-* ×7"), so one big family costs ONE
+  # of the NOTIFY_MAXNAMES slots instead of burying every other name behind
+  # "+N more" — on a 149-package apt day that is the difference between seeing
+  # brave-browser and not. Order follows each group's first member. Names with
+  # no '-' (flatpak display names, most standalone tools) are never touched.
+  local -a names=(); local -A cnt=() seen=(); local n key
+  mapfile -t names
+  (( ${#names[@]} )) || return 0
+  if (( NOTIFY_GROUP_MIN < 2 )); then printf '1\t%s\n' "${names[@]}"; return 0; fi
+  for n in "${names[@]}"; do
+    [[ "$n" == *-* ]] || continue
+    key="${n%%-*}"; cnt["$key"]=$(( ${cnt["$key"]:-0} + 1 ))
+  done
+  for n in "${names[@]}"; do
+    key="${n%%-*}"
+    if [[ "$n" == *-* ]] && (( ${cnt["$key"]:-0} >= NOTIFY_GROUP_MIN )); then
+      [[ -n "${seen["$key"]:-}" ]] && continue
+      seen["$key"]=1
+      printf '%d\t%s-* ×%d\n' "${cnt["$key"]}" "$key" "${cnt["$key"]}"
+    else
+      printf '1\t%s\n' "$n"
+    fi
+  done
+}
+
 notify_lines() {  # one line per pending source, naming what will change
   # Every source formats its pending list as "name<2 spaces>old → new", so the
   # name is whatever precedes the first double space — this also survives
   # flatpak's spaced display names ("Ente Photos").
-  local src n names shown extra ess=()
+  local src n names shown extra e entries pkgs_shown ess=()
   # Essentials go first AND are removed from their own source's line below, so
   # a name never appears twice and can never be pushed out of sight by the cap.
-  # Deliberately uncapped: the list is curated by hand, so its length is yours
-  # to control, and truncating the one list you asked to see defeats the point.
+  # Deliberately uncapped, and deliberately NOT prefix-grouped: the list is
+  # curated by hand, so its length is yours to control, and collapsing or
+  # truncating the one list you asked to see by name defeats the point.
   for src in "${PENDING_SOURCES[@]}"; do
     mapfile -t -O "${#ess[@]}" ess < <(src_names "$src" essential)
   done
@@ -174,22 +222,81 @@ notify_lines() {  # one line per pending source, naming what will change
       [[ -z "${PENDING[$src]:-}" ]] && (( n > 0 )) && printf '%s: %d\n' "$src" "$n"
       continue
     fi
-    shown=( "${names[@]:0:NOTIFY_MAXNAMES}" )
-    extra=$(( ${#names[@]} - ${#shown[@]} ))
+    mapfile -t entries < <(printf '%s\n' "${names[@]}" | group_names)
+    shown=(); pkgs_shown=0
+    for e in "${entries[@]:0:NOTIFY_MAXNAMES}"; do
+      shown+=( "${e#*$'\t'}" )
+      pkgs_shown=$(( pkgs_shown + ${e%%$'\t'*} ))
+    done
+    # "+N more" keeps counting PACKAGES, not entries — a collapsed group already
+    # carries its own ×N, so counting entries would hide those twice over.
+    extra=$(( ${#names[@]} - pkgs_shown ))
     printf '%s %d — %s' "$src" "${#names[@]}" "$(join_list ', ' "${shown[@]}")"
     (( extra > 0 )) && printf ', +%d more' "$extra"
     printf '\n'
   done
 }
 
-send_notification() {
-  local summary="$1" body="$2"
-  command -v notify-send >/dev/null 2>&1 || return 0
+action_available() {  # can the notification be made clickable?
+  $NOTIFY_ACTION || return 1
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  command -v "${UPDATE_ALL_TERMINAL%% *}" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+notify_plain() {  # fire-and-forget: no action, nothing left running
   # -t 0: never expire. This is a once-a-day reminder — a banner that vanishes after a
   # few seconds is missed unless you happen to be looking at the screen when the timer fires.
-  DISPLAY="${DISPLAY:-:0}" \
-  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
-  notify-send -a "update-all" -i software-update-available -t 0 "$summary" "$body" || true
+  # (Keep comments ABOVE this chain: one inserted between the last `\` and the
+  #  command still passes `bash -n` but silently detaches the env prefix.)
+  DISPLAY="$1" DBUS_SESSION_BUS_ADDRESS="$2" \
+  notify-send -a "update-all" -i software-update-available -t 0 "$3" "$4" || true
+}
+
+send_notification() {
+  local summary="$1" body="$2" disp bus
+  command -v notify-send >/dev/null 2>&1 || return 0
+  disp="${DISPLAY:-:0}"
+  bus="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+
+  if ! action_available; then notify_plain "$disp" "$bus" "$summary" "$body"; return 0; fi
+
+  # cosmic-notifications draws NO action buttons — it advertises `actions` in
+  # GetCapabilities and then ignores the labels — but it DOES deliver
+  # ActionInvoked when the notification body is clicked, firing the first action.
+  # So a single action named `default` means "click the notification to run this",
+  # while the X still dismisses without firing anything. (Probed 2026-09-05.)
+  #
+  # Two measured facts force the shape below:
+  #   * `notify-send -A` implies --wait, and this daemon never emits
+  #     NotificationClosed — not on dismiss, not even on expiry — so the waiting
+  #     process would hang forever. It has to be time-bounded from outside.
+  #   * When ExecStart returns, systemd kills the rest of the service cgroup, so
+  #     a plain background child would die with the check. It needs its own unit.
+  # …and a third fact shapes the click handler: cosmic-term DOUBLE-FORKS and
+  # returns in ~5 ms, so a terminal started inside this unit is killed by the
+  # cgroup teardown the instant the waiter exits — it never draws. It therefore
+  # goes into a unit of its own with KillMode=process. That property must NOT be
+  # put on the waiter: stopping a waiter would then leave its notify-send behind,
+  # blocked forever on a NotificationClosed this daemon never sends.
+  systemctl --user stop         "$NOTIFY_UNIT.service" >/dev/null 2>&1
+  systemctl --user reset-failed "$NOTIFY_UNIT.service" >/dev/null 2>&1
+  # $4 (the terminal) is unquoted on purpose — it carries its own arguments.
+  if systemd-run --user --quiet --collect --unit="$NOTIFY_UNIT" \
+       --property=RuntimeMaxSec="$NOTIFY_ACTION_TTL" \
+       --setenv=DISPLAY="$disp" --setenv=DBUS_SESSION_BUS_ADDRESS="$bus" \
+       bash -c '
+         a=$(notify-send -a "update-all" -i software-update-available -t 0 \
+               -A "default=$3" "$1" "$2") || exit 0
+         [ "$a" = default ] || exit 0
+         exec systemd-run --user --quiet --collect --property=KillMode=process \
+              --description="update-all (from notification)" \
+              $4 bash -lc "$5"
+       ' "$NOTIFY_UNIT" "$summary" "$body" "Update now" "$UPDATE_ALL_TERMINAL" \
+         'update-all; printf "\n[finished — press enter to close] "; read -r _'
+  then return 0; fi
+  # transient unit refused (no user manager, name taken, …) — still notify
+  notify_plain "$disp" "$bus" "$summary" "$body"
 }
 
 find_npm() {
@@ -602,9 +709,11 @@ if $NOTIFY; then
   # silent when the same number of different packages comes up
   fingerprint=$(printf '%s' "$body" | md5sum | cut -d' ' -f1)
   if ! $ONLY_NEW || [[ "$fingerprint" != "$(cat "$CACHE_DIR/last" 2>/dev/null)" ]]; then
+    hint="Run: update-all"
+    action_available && hint="Click this notification to update  ·  or run: update-all"
     send_notification "$TOTAL update(s) available" "$body
 
-Run: update-all"
+$hint"
   fi
   printf '%s' "$fingerprint" > "$CACHE_DIR/last"
 fi
