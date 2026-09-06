@@ -67,6 +67,11 @@ ALL_SOURCES=(apt flatpak npm deb standalone)
 ESSENTIALS_FILE="${UPDATE_ALL_ESSENTIALS:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all/essentials}"
 ESSENTIAL_PATTERNS=()
 NET_TIMEOUT=90
+# Claude Code's native install publishes parallel release channels ("stable" is
+# deliberately behind "latest") and records nowhere which one it is on, so this
+# has to be an assumption — kept here, in one word, rather than buried inside a
+# checker. Set CLAUDE_CHANNEL=stable if this box is ever switched over.
+CLAUDE_CHANNEL="${CLAUDE_CHANNEL:-latest}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/update-all"
 # $0 is usually the ~/.local/bin symlink — resolve it so sibling scripts in the
 # repo (update-discord) are found no matter how update-all was invoked.
@@ -636,16 +641,43 @@ apply_deb() {
 }
 
 # ── Standalone (installed outside every package manager) ────────────────────
+# RULE FOR THIS SECTION: ask the oracle the APPLY PATH uses. A check that reads
+# a different registry than the installer will silently disagree with it — see
+# the Proton channel bug (notes/update-all.md §4b) for how that fails: not with
+# an error, but with a confident "up to date" (or a pending item that applying
+# never clears). grok is the model to copy: it answers with its own channel.
+CLAUDE_DIST="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
+CODEX_RELEASES="https://api.github.com/repos/openai/codex/releases/latest"
+
+claude_release() {  # → version on $CLAUDE_CHANNEL, from the manifest `claude update` reads
+  local v
+  v=$(timeout "$NET_TIMEOUT" curl -fsSL "$CLAUDE_DIST/$CLAUDE_CHANNEL" 2>/dev/null | tr -d '[:space:]')
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && { printf '%s\n' "$v"; return 0; }
+  # Transport fallback only: npm mirrors the SAME channel names as dist-tags, so
+  # this still answers for $CLAUDE_CHANNEL rather than defaulting to "latest".
+  timeout "$NET_TIMEOUT" "${NPM:-npm}" view @anthropic-ai/claude-code \
+    "dist-tags.$CLAUDE_CHANNEL" 2>/dev/null | tr -d '[:space:]'
+}
+
+codex_release() {  # → version of the GitHub release apply_codex would install
+  # Not npm: the two lead each other and the package carries alpha/beta/native
+  # tags. releases/latest also excludes prereleases by definition.
+  timeout "$NET_TIMEOUT" curl -fsSL "$CODEX_RELEASES" 2>/dev/null \
+    | jq -r '.tag_name // empty' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
+}
+
 standalone_pending() {
   local bin have want
   if bin=$(find_bin claude); then
     have=$("$bin" --version 2>/dev/null | grep -oE '^[0-9.]+')
-    want=$(timeout "$NET_TIMEOUT" "${NPM:-npm}" view @anthropic-ai/claude-code version 2>/dev/null | tr -d '[:space:]')
-    [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" && printf 'claude  %s → %s\n' "$have" "$want"
+    want=$(claude_release)
+    [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" \
+      && printf 'claude  %s → %s%s\n' "$have" "$want" \
+         "$([[ "$CLAUDE_CHANNEL" == latest ]] || echo " ($CLAUDE_CHANNEL channel)")"
   fi
   if bin=$(find_bin codex); then
     have=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    want=$(timeout "$NET_TIMEOUT" "${NPM:-npm}" view @openai/codex version 2>/dev/null | tr -d '[:space:]')
+    want=$(codex_release)
     [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" && printf 'codex  %s → %s\n' "$have" "$want"
   fi
   if bin=$(find_bin grok); then
@@ -677,7 +709,7 @@ check_standalone() {
 apply_codex() {
   local bin tmp url asset
   bin=$(find_bin codex) || return 1
-  url=$(timeout "$NET_TIMEOUT" curl -fsSL https://api.github.com/repos/openai/codex/releases/latest 2>/dev/null \
+  url=$(timeout "$NET_TIMEOUT" curl -fsSL "$CODEX_RELEASES" 2>/dev/null \
         | jq -r '.assets[] | select(.name == "codex-x86_64-unknown-linux-musl.tar.gz") | .browser_download_url')
   [[ -z "$url" || "$url" == null ]] && { warn "codex: no linux-musl asset in the latest release"; return 1; }
   tmp=$(mktemp -d)
