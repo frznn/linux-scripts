@@ -14,6 +14,9 @@
 #   update-all                  # check everything, show how to apply, then prompt
 #   update-all npm deb          # only these sources (still prompts)
 #   update-all --notify         # check + desktop notification (names what is pending)
+#   update-all --cached         # reuse the last check's results, however old (what a
+#                               # click on the notification runs) — no re-check
+#   update-all --fresh          # always re-check, even if a recent result is cached
 #   update-all --full           # don't truncate long package lists
 #   update-all --only-new       # with --notify: notify only if the pending set changed
 #   update-all --no-action      # with --notify: don't arm the click-to-run action
@@ -21,8 +24,16 @@
 #   Sources: apt  flatpak  npm  deb  standalone   (default: all)
 #
 # The check is READ-ONLY and needs no privileges. Applying only ever happens
-# after an explicit answer at the prompt — and the prompt appears only on a
-# terminal, so an unattended run (the timer) reports and stops.
+# after an answer at the prompt — plain Enter means "apply everything" — and
+# the prompt appears only on a terminal, so an unattended run (the timer)
+# reports and stops.
+#
+# RESULTS CACHE: every check writes what it found to ~/.cache/update-all/pending.
+# A later run reuses it instead of re-checking when it is younger than
+# UPDATE_ALL_CACHE_TTL (default 3600 s), or always with --cached, or never with
+# --fresh / --notify. Applying anything discards it, so the next run re-checks.
+# The point: the daily notification comes from a check that just ran, so
+# clicking it should land on the prompt, not on another 15-second check.
 #
 # EXIT CODES
 #   0  nothing pending, or everything applied
@@ -73,6 +84,12 @@ NET_TIMEOUT=90
 # checker. Set CLAUDE_CHANNEL=stable if this box is ever switched over.
 CLAUDE_CHANNEL="${CLAUDE_CHANNEL:-latest}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/update-all"
+CACHE_FILE="$CACHE_DIR/pending"       # the last check's results — save_cache() / replay_cache()
+CACHE_TTL="${UPDATE_ALL_CACHE_TTL:-3600}"   # seconds a cached result is reused without asking
+USE_CACHE=auto                        # auto (within CACHE_TTL) | always (--cached) | never (--fresh, --notify)
+FROM_CACHE=false
+CACHED_AT=0
+CACHED_SOURCES=()
 # $0 is usually the ~/.local/bin symlink — resolve it so sibling scripts in the
 # repo (update-discord) are found no matter how update-all was invoked.
 SELF_DIR="$(dirname "$(readlink -f "$0")")"
@@ -83,6 +100,8 @@ for arg in "$@"; do
     --full)            FULL=true ;;
     --only-new)        ONLY_NEW=true ;;
     --no-action)       NOTIFY_ACTION=false ;;
+    --cached)          USE_CACHE=always ;;
+    --fresh)           USE_CACHE=never ;;
     # print the header comment block, stopping at the first line of code — a
     # fixed line range silently starts leaking `set -uo pipefail` the moment
     # anything above it grows. The rule lines are matched as "# <punctuation
@@ -94,6 +113,8 @@ for arg in "$@"; do
   esac
 done
 (( ${#SOURCES[@]} )) || SOURCES=("${ALL_SOURCES[@]}")
+# --notify is the producer of the cache, never a consumer: the timer must look.
+$NOTIFY && USE_CACHE=never
 
 wants() { local s; for s in "${SOURCES[@]}"; do [[ "$s" == "$1" ]] && return 0; done; return 1; }
 
@@ -107,6 +128,8 @@ join_list() { local sep="$1"; shift; local out="" i; for i in "$@"; do out+="${o
 declare -A COUNT=()      # source → number pending
 declare -A PENDING=()    # source → "name  old → new" lines (computed once, reused by apply)
 declare -A HOWTO=()      # source → the command to apply that source by hand
+declare -A TITLE=([apt]="APT" [flatpak]="Flatpak" [npm]="npm (global)" [deb]="Hand-installed .debs" [standalone]="Standalone")
+declare -A LABEL=([apt]="package(s) upgradable" [flatpak]="app(s)" [npm]="global package(s)" [deb]="package(s)" [standalone]="tool(s)")
 TOTAL=0
 FAILED=false
 
@@ -298,10 +321,67 @@ send_notification() {
               --description="update-all (from notification)" \
               $4 bash -lc "$5"
        ' "$NOTIFY_UNIT" "$summary" "$body" "Update now" "$UPDATE_ALL_TERMINAL" \
-         'update-all; printf "\n[finished — press enter to close] "; read -r _'
+         'update-all --cached; printf "\n[finished — press enter to close] "; read -r _'
   then return 0; fi
   # transient unit refused (no user manager, name taken, …) — still notify
   notify_plain "$disp" "$bus" "$summary" "$body"
+}
+
+# ── results cache ────────────────────────────────────────────────────────────
+# What a check found, serialised with `declare -p` so the apply path can run on
+# it exactly as it runs on a live check. The file is sourced, so it is trusted
+# only when it is ours and nobody else can write it — the same trust as $HOME.
+save_cache() {
+  mkdir -p "$CACHE_DIR" || return 0
+  # umask 077: the file is sourced, and cache_trusted() refuses anything that
+  # is group- or world-writable — which under this box's 002 umask is every
+  # file created by default.
+  (umask 077
+  {
+    printf '# update-all results — written %s. Sourced by update-all; do not edit.\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'CACHED_AT=%s\n' "$(date +%s)"
+    printf 'CACHED_SOURCES=(%s)\n' "${SOURCES[*]}"
+    declare -p COUNT PENDING HOWTO
+  } > "$CACHE_FILE.tmp" && mv -f "$CACHE_FILE.tmp" "$CACHE_FILE")
+}
+
+cache_trusted() {  # the file exists, is ours, and only we can write it
+  [[ -f "$CACHE_FILE" && -O "$CACHE_FILE" ]] || return 1
+  local mode; mode=$(stat -c %a "$CACHE_FILE" 2>/dev/null) || return 1
+  (( (8#$mode & 8#022) == 0 ))
+}
+
+cache_covers() {  # every wanted source was part of the cached check
+  local s c hit
+  for s in "${SOURCES[@]}"; do
+    hit=false
+    for c in "${CACHED_SOURCES[@]}"; do [[ "$c" == "$s" ]] && hit=true; done
+    $hit || return 1
+  done
+  return 0
+}
+
+cache_age() { echo $(( $(date +%s) - CACHED_AT )); }
+
+age_human() {  # seconds → "3 min" / "2 h 05 min"
+  local s="$1"
+  if (( s < 60 )); then echo "${s} s"
+  elif (( s < 3600 )); then echo "$(( s / 60 )) min"
+  else printf '%d h %02d min\n' $(( s / 3600 )) $(( s % 3600 / 60 )); fi
+}
+
+replay_cache() {  # print the cached results in the live check's layout
+  local s count list
+  for s in "${ALL_SOURCES[@]}"; do
+    wants "$s" || continue
+    section "${TITLE[$s]}"
+    count=${COUNT[$s]:-0}; list="${PENDING[$s]:-}"
+    if (( count == 0 )); then ok "up to date"; continue; fi
+    printf "  %s %s\n" "$count" "${LABEL[$s]}"
+    if [[ -n "$list" ]]; then printf '%s\n' "$list" | truncate_list
+    else note "    (names not recorded — runtimes/extensions only)"; fi
+    TOTAL=$(( TOTAL + count ))
+  done
 }
 
 find_npm() {
@@ -334,14 +414,14 @@ find_bin() {
 
 # ── APT ──────────────────────────────────────────────────────────────────────
 check_apt() {
-  section "APT"
+  section "${TITLE[apt]}"
   HOWTO[apt]='sudo apt update && sudo apt full-upgrade'
   local stamp age
   stamp=$(stat -c %Y /var/lib/apt/lists 2>/dev/null || echo 0)
   age=$(( ( $(date +%s) - stamp ) / 3600 ))
   PENDING[apt]=$(apt list --upgradable 2>/dev/null | tail -n +2 \
          | sed -E 's|^([^/]+)/\S+ (\S+) \S+ \[upgradable from: ([^]]+)\]|\1  \3 → \2|')
-  report apt "package(s) upgradable"
+  report apt "${LABEL[apt]}"
   note "package lists last refreshed ${age}h ago (apt-daily.timer)"
 }
 
@@ -357,7 +437,7 @@ apply_apt() {
 
 # ── Flatpak ──────────────────────────────────────────────────────────────────
 check_flatpak() {
-  section "Flatpak"
+  section "${TITLE[flatpak]}"
   HOWTO[flatpak]='flatpak update'
   local scope out="" rt
   for scope in user system; do
@@ -367,7 +447,7 @@ check_flatpak() {
   done
   rt=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --runtime 2>/dev/null | grep -c . )
   PENDING[flatpak]=$(printf '%s' "$out" | grep . )
-  report flatpak "app(s)"
+  report flatpak "${LABEL[flatpak]}"
   if (( rt > 0 )); then
     note "plus $rt runtime/extension update(s) — pulled in by the same command"
     (( ${COUNT[flatpak]:-0} == 0 )) && { COUNT[flatpak]=$rt; TOTAL=$(( TOTAL + rt )); }
@@ -479,10 +559,10 @@ npm_unsupported() {
 }
 
 check_npm() {
-  section "npm (global)"
+  section "${TITLE[npm]}"
   if [[ -z "$NPM" ]]; then warn "npm not found"; COUNT[npm]=0; return 0; fi
   PENDING[npm]=$(npm_pending)
-  report npm "global package(s)"
+  report npm "${LABEL[npm]}"
   local cmds=""
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -596,9 +676,9 @@ deb_pending() {
 }
 
 check_deb() {
-  section "Hand-installed .debs"
+  section "${TITLE[deb]}"
   PENDING[deb]=$(deb_pending)
-  report deb "package(s)"
+  report deb "${LABEL[deb]}"
   local hints=()
   grep -q '^discord' <<<"${PENDING[deb]}" && hints+=("update-discord")
   grep -q '^proton-mail' <<<"${PENDING[deb]}" && hints+=("update-all deb")
@@ -692,9 +772,9 @@ standalone_pending() {
 }
 
 check_standalone() {
-  section "Standalone"
+  section "${TITLE[standalone]}"
   PENDING[standalone]=$(standalone_pending)
-  report standalone "tool(s)"
+  report standalone "${LABEL[standalone]}"
   local hints=()
   grep -q '^claude' <<<"${PENDING[standalone]}" && hints+=("claude update")
   grep -q '^grok'   <<<"${PENDING[standalone]}" && hints+=("grok update")
@@ -745,7 +825,26 @@ apply_standalone() {
 load_essentials
 printf "\033[1mupdate-all\033[0m — %s\n" "$(date '+%Y-%m-%d %H:%M')"
 
-for s in "${ALL_SOURCES[@]}"; do wants "$s" && "check_$s"; done
+# Reuse the last check when it is recent (or asked for), else check live. The
+# file is sourced HERE, at top level: inside a function `declare -A` would make
+# the arrays local and the results would vanish on return.
+if [[ "$USE_CACHE" != never ]] && cache_trusted; then
+  # shellcheck source=/dev/null
+  source "$CACHE_FILE" 2>/dev/null
+  if cache_covers && { [[ "$USE_CACHE" == always ]] || (( $(cache_age) <= CACHE_TTL )); }; then
+    FROM_CACHE=true
+  else
+    COUNT=(); PENDING=(); HOWTO=()
+  fi
+fi
+if $FROM_CACHE; then
+  note "results of the check run $(age_human "$(cache_age)") ago ($(date -d "@$CACHED_AT" '+%H:%M')) — not re-checking; use --fresh to look again"
+  replay_cache
+else
+  [[ "$USE_CACHE" == always ]] && note "no usable cached result — checking now"
+  for s in "${ALL_SOURCES[@]}"; do wants "$s" && "check_$s"; done
+  save_cache
+fi
 
 PENDING_SOURCES=()
 SUMMARY=()
@@ -806,12 +905,14 @@ if [[ ! -t 0 || ! -t 1 ]]; then
 fi
 
 echo
-read -r -p "Apply now? [y] all · [n] none · or name sources (${PENDING_SOURCES[*]}): " answer
-answer=${answer:-n}
+# Enter applies everything: the prompt is only ever reached on a terminal, by
+# someone who just read the list — and most days the answer is "yes, all".
+read -r -p "Apply now? [Y] all · [n] none · or name sources (${PENDING_SOURCES[*]}): " answer
+answer=${answer:-y}
 
 case "$answer" in
   y|Y|yes|all) CHOSEN=("${PENDING_SOURCES[@]}") ;;
-  n|N|no|"")   echo "Nothing applied."; exit 10 ;;
+  n|N|no)      echo "Nothing applied."; exit 10 ;;
   *)
     CHOSEN=()
     for want in $answer; do
@@ -826,6 +927,8 @@ esac
 for s in "${ALL_SOURCES[@]}"; do
   for c in "${CHOSEN[@]}"; do [[ "$c" == "$s" ]] && "apply_$s"; done
 done
+# Whatever happened above, the cached result no longer describes this box.
+rm -f "$CACHE_FILE"
 
 echo
 $FAILED && { printf "\033[1;31mSome updates failed — see above.\033[0m\n"; exit 1; }
