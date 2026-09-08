@@ -12,23 +12,27 @@ ids / prefixes and refuses to `delete` a session that's currently live. See
 
 ## update-all
 
-One report for every update source on this box — **APT**, **Flatpak** (user *and* system scope),
-**global npm** packages, **hand-installed `.deb`s** that apt structurally cannot see, and the
-standalone **AI CLIs** (`claude` / `codex` / `grok`) that no package manager tracks. Checking is
-read-only and needs no privileges; applying is always explicit.
+One report for every update source on this box — **APT**, **Flatpak** (user *and* system scope,
+apps and runtimes/extensions alike, all named), **global npm** packages, **hand-installed `.deb`s**
+that apt structurally cannot see, and **standalone** tools (`claude` / `codex` / `grok`) that no
+package manager tracks. Checking is read-only and needs no privileges; applying is always explicit.
 
-Sources: `apt` · `flatpak` · `npm` · `deb` · `ai`
+Sources: `apt` · `flatpak` · `npm` · `deb` · `standalone`
 
 ```bash
 update-all                  # check everything, show how to apply, then prompt
 update-all npm deb          # only these sources (still prompts)
 update-all --notify         # check + desktop notification; never prompts
 update-all --full           # don't truncate long lists
+update-all --cached         # replay the last check's results, however old (no re-check)
+update-all --fresh          # ignore the cached results and check now
 ```
 
 There is no `--apply` flag: a run reports what is pending, prints the command that applies each
-source **by hand**, and then asks. The prompt takes `y` (all), `n` (nothing, the default), or a list
-of sources to apply — and appears only on a terminal, so an unattended run reports and stops.
+source **by hand**, and then asks. The prompt takes `Y` (all, the default — plain Enter applies
+everything), `n` (nothing), or a list of sources to apply — and appears only on a terminal, so an
+unattended run reports and stops, which is what makes a "yes" default safe. A plain run reuses the
+last check's results if they are under an hour old.
 
 Exit codes: `0` up to date or applied · `10` pending, not applied · `1` an apply failed.
 
@@ -43,7 +47,7 @@ For a daily check + notification, a **user** systemd timer (no root — the chec
 ```ini
 # ~/.config/systemd/user/update-all.service
 [Unit]
-Description=Check for pending updates (apt, flatpak, npm, AI CLIs) and notify
+Description=Check for pending updates (apt, flatpak, npm, deb, standalone) and notify
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/update-all --notify
