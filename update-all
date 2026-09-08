@@ -129,7 +129,7 @@ declare -A COUNT=()      # source → number pending
 declare -A PENDING=()    # source → "name  old → new" lines (computed once, reused by apply)
 declare -A HOWTO=()      # source → the command to apply that source by hand
 declare -A TITLE=([apt]="APT" [flatpak]="Flatpak" [npm]="npm (global)" [deb]="Hand-installed .debs" [standalone]="Standalone")
-declare -A LABEL=([apt]="package(s) upgradable" [flatpak]="app(s)" [npm]="global package(s)" [deb]="package(s)" [standalone]="tool(s)")
+declare -A LABEL=([apt]="package(s) upgradable" [flatpak]="update(s)" [npm]="global package(s)" [deb]="package(s)" [standalone]="tool(s)")
 TOTAL=0
 FAILED=false
 
@@ -245,8 +245,9 @@ notify_lines() {  # one line per pending source, naming what will change
     n=${COUNT[$src]:-0}
     mapfile -t names < <(src_names "$src" rest)
     if (( ${#names[@]} == 0 )); then
-      # a source can report a count with no names (flatpak: runtimes only);
-      # if it had names and they were all essential, it has nothing left to say
+      # a count with no names is a defensive case only — every source names what
+      # it counts (flatpak runtimes included since 2026-09-08); if a source had
+      # names and they were all essential, it has nothing left to say
       [[ -z "${PENDING[$src]:-}" ]] && (( n > 0 )) && printf '%s: %d\n' "$src" "$n"
       continue
     fi
@@ -379,7 +380,7 @@ replay_cache() {  # print the cached results in the live check's layout
     if (( count == 0 )); then ok "up to date"; continue; fi
     printf "  %s %s\n" "$count" "${LABEL[$s]}"
     if [[ -n "$list" ]]; then printf '%s\n' "$list" | truncate_list
-    else note "    (names not recorded — runtimes/extensions only)"; fi
+    else note "    (names not recorded — cache written by an older update-all)"; fi
     TOTAL=$(( TOTAL + count ))
   done
 }
@@ -439,18 +440,29 @@ apply_apt() {
 check_flatpak() {
   section "${TITLE[flatpak]}"
   HOWTO[flatpak]='flatpak update'
-  local scope out="" rt
+  # Apps AND runtimes/extensions are listed by name, each tagged with its scope.
+  # Runtimes used to be a bare count ("plus 5 runtime/extension update(s)"), which
+  # left the notification saying "flatpak: 5" with nothing to say what — and on a
+  # day with no app updates that reads as "5 apps, names lost" (2026-09-08).
+  # A runtime line is "<id>//<branch>  <version>  [<scope> runtime]": the
+  # id//branch form is flatpak's own, and the branch matters because the same id
+  # (Platform.GL.default) ships 26.08 and 26.08-extra as two separate updates.
+  local scope apps="" rts="" a r
   for scope in user system; do
-    out+=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --app --"$scope" \
-             --columns=name,application,version 2>/dev/null \
-           | sed -E "s/\t/  /g; s/$/  [$scope]/")$'\n'
+    a=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --app --"$scope" \
+          --columns=name,application,version 2>/dev/null \
+        | sed -E "s/\t/  /g; s/$/  [$scope]/")
+    r=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --runtime --"$scope" \
+          --columns=application,branch,version 2>/dev/null \
+        | awk -F'\t' -v s="$scope" '{ v = ($3 == "" ? "" : $3 "  ");
+                                       printf "%s//%s  %s[%s runtime]\n", $1, $2, v, s }')
+    [[ -n "$a" ]] && apps+="$a"$'\n'
+    [[ -n "$r" ]] && rts+="$r"$'\n'
   done
-  rt=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --runtime 2>/dev/null | grep -c . )
-  PENDING[flatpak]=$(printf '%s' "$out" | grep . )
+  PENDING[flatpak]=$(printf '%s%s' "$apps" "$rts" | grep . )
   report flatpak "${LABEL[flatpak]}"
-  if (( rt > 0 )); then
-    note "plus $rt runtime/extension update(s) — pulled in by the same command"
-    (( ${COUNT[flatpak]:-0} == 0 )) && { COUNT[flatpak]=$rt; TOTAL=$(( TOTAL + rt )); }
+  if [[ -n "$rts" ]]; then
+    note "  $(printf '%s' "$apps" | grep -c .) app(s) + $(printf '%s' "$rts" | grep -c .) runtime/extension(s) — one 'flatpak update' pulls in both"
   fi
 }
 
