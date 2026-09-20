@@ -1,0 +1,17 @@
+[Unit]
+Description=Watch cosmic-settings-daemon for the bus-socket stall at login
+# The daemon is part of the graphical session, so there is nothing to watch
+# before it; the script itself waits for the bus name rather than ordering on a
+# unit, because cosmic-session starts the daemon, not systemd.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cosmic-volume-watch
+# The window is bounded and the script exits on its own; a failed run should not
+# be retried, since the interesting moment has passed by then.
+Restart=no
+
+[Install]
+WantedBy=graphical-session.target
