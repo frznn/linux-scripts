@@ -98,10 +98,15 @@ with an empty `/usr` prefix — a silent false negative.
 
 ### codex
 
-Installed here as a GitHub release binary, so `codex update` bails with "Could not detect the Codex
-installation method". `update-all` fetches `codex-x86_64-unknown-linux-musl.tar.gz` from the latest
-release, **runs `--version` on the new binary before it replaces the old one**, and keeps the
-previous binary at `~/.local/bin/codex.bak`.
+Installed here as the GitHub release package, so `codex update` bails with "Could not detect the Codex
+installation method". The package, not the lone binary, because codex runs no tools without the
+`codex-code-mode-host` it ships beside `bin/codex`. `update-all` fetches
+`codex-package-x86_64-unknown-linux-musl.tar.gz` from the latest release and checks its sha256
+against both the API digest and `codex-package_SHA256SUMS`. It refuses absolute, `..` or escaping-link
+entries, and checks that the host is present and that `--version` runs. It extracts into
+`~/.codex/packages/standalone/releases/<version>-<target>/` and moves `current` there. The previous
+release stays for rollback (`ln -sfn <previous> ~/.codex/packages/standalone/current`); older ones
+are pruned. `~/.local/bin/codex` links to `current/bin/codex`.
 
 ## update-discord
 

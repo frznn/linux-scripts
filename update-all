@@ -771,6 +771,9 @@ standalone_pending() {
     have=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
     want=$(codex_release)
     [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" && printf 'codex  %s → %s\n' "$have" "$want"
+    # A lone binary without the code-mode host runs no tools; say so.
+    [[ -x "$(dirname "$(readlink -f "$bin")")/codex-code-mode-host" ]] \
+      || printf 'codex  %s → %s (reinstall as release package: no code-mode host)\n' "${have:-?}" "${want:-?}"
   fi
   if bin=$(find_bin grok); then
     local json
@@ -793,27 +796,86 @@ check_standalone() {
   grep -q '^codex'  <<<"${PENDING[standalone]}" && hints+=("update-all standalone")
   HOWTO[standalone]=$(join_list '  ·  ' "${hints[@]:-}")
   grep -q '^codex' <<<"${PENDING[standalone]}" && \
-    note "codex is a release binary — 'codex update' can't self-update it, update-all replaces it"
+    note "codex is the release package — 'codex update' can't self-update it, update-all installs the new release beside the old"
 }
 
-# codex here is the GitHub release binary (deliberate: leanest trusted channel),
-# so its own `update` bails with "Could not detect the Codex installation method".
+# codex is installed as the official release PACKAGE, not the lone binary: the
+# package carries bin/codex-code-mode-host, the second binary codex looks for
+# beside its own resolved path, and without it every tool call fails. Layout
+# (the one the upstream install.sh creates):
+#   $CODEX_ROOT/releases/<version>-<target>/   one directory per release
+#   $CODEX_ROOT/current                        symlink to the active release
+#   ~/.local/bin/codex                         symlink to current/bin/codex
+# A release is extracted whole, verified, and only then is `current` moved, so
+# the previous release stays intact for rollback and a failure changes nothing.
+CODEX_ROOT="${CODEX_ROOT:-$HOME/.codex/packages/standalone}"
+CODEX_TARGET=x86_64-unknown-linux-musl
+
+# Refuse a package whose entries could write outside the extraction directory:
+# absolute names, `..` components, or links pointing absolute/upward.
+codex_archive_safe() {  # <tarball>
+  local line name target
+  while IFS= read -r line; do
+    name=${line#*[0-9]:[0-9][0-9] }
+    target=
+    if [[ "$name" == *' -> '* ]]; then target=${name#* -> }; name=${name%% -> *}; fi
+    if [[ "$name" == /* || "$name" == ../* || "$name" == */../* || "$name" == .. || "$name" == */.. ]]; then
+      warn "codex: unsafe path in package: $name"; return 1
+    fi
+    if [[ -n "$target" && ( "$target" == /* || "$target" == ../* || "$target" == */../* || "$target" == .. ) ]]; then
+      warn "codex: unsafe link in package: $name -> $target"; return 1
+    fi
+    case "$line" in h*) warn "codex: hardlink in package: $name"; return 1 ;; esac
+  done < <(tar -tzvf "$1")
+}
+
 apply_codex() {
-  local bin tmp url asset
-  bin=$(find_bin codex) || return 1
-  url=$(timeout "$NET_TIMEOUT" curl -fsSL "$CODEX_RELEASES" 2>/dev/null \
-        | jq -r '.assets[] | select(.name == "codex-x86_64-unknown-linux-musl.tar.gz") | .browser_download_url')
-  [[ -z "$url" || "$url" == null ]] && { warn "codex: no linux-musl asset in the latest release"; return 1; }
+  local rel tag ver url digest sums_url tmp want got dest stage prev old
+  rel=$(timeout "$NET_TIMEOUT" curl -fsSL "$CODEX_RELEASES" 2>/dev/null) || { warn "codex: release lookup failed"; return 1; }
+  tag=$(jq -r '.tag_name // empty' <<<"$rel"); ver=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$tag" | head -n1)
+  url=$(jq -r --arg n "codex-package-$CODEX_TARGET.tar.gz" '.assets[]|select(.name==$n)|.browser_download_url' <<<"$rel")
+  digest=$(jq -r --arg n "codex-package-$CODEX_TARGET.tar.gz" '.assets[]|select(.name==$n)|.digest // empty' <<<"$rel")
+  sums_url=$(jq -r '.assets[]|select(.name=="codex-package_SHA256SUMS")|.browser_download_url' <<<"$rel")
+  [[ -n "$ver" && -n "$url" && "$url" != null ]] || { warn "codex: no $CODEX_TARGET package in the latest release"; return 1; }
+  [[ "$digest" == sha256:* && -n "$sums_url" && "$sums_url" != null ]] || { warn "codex: release lacks a digest or SHA256SUMS — refusing"; return 1; }
+  dest="$CODEX_ROOT/releases/$ver-$CODEX_TARGET"
+  mkdir -p "$CODEX_ROOT/releases" || return 1
   tmp=$(mktemp -d)
-  timeout 900 curl -fL# "$url" -o "$tmp/codex.tar.gz" || { warn "codex download failed"; rm -rf "$tmp"; return 1; }
-  tar -xzf "$tmp/codex.tar.gz" -C "$tmp" || { warn "codex: extract failed"; rm -rf "$tmp"; return 1; }
-  asset=$(find "$tmp" -type f -name 'codex*' ! -name '*.tar.gz' | head -n1)
-  [[ -x "$asset" ]] || chmod +x "$asset" 2>/dev/null
-  # Prove the new binary runs before it replaces the working one.
-  if ! "$asset" --version >/dev/null 2>&1; then warn "codex: new binary won't run — keeping the old one"; rm -rf "$tmp"; return 1; fi
-  cp -f "$bin" "$bin.bak" && mv -f "$asset" "$bin" && chmod +x "$bin" || { warn "codex: replace failed"; rm -rf "$tmp"; return 1; }
+  timeout 900 curl -fL# "$url" -o "$tmp/pkg.tar.gz" || { warn "codex download failed"; rm -rf "$tmp"; return 1; }
+  timeout "$NET_TIMEOUT" curl -fsSL "$sums_url" -o "$tmp/SHA256SUMS" || { warn "codex: SHA256SUMS download failed"; rm -rf "$tmp"; return 1; }
+  # Two independent sources (API digest, release checksum file) must agree
+  # with the bytes; either alone could be a stale or tampered listing.
+  got=$(sha256sum "$tmp/pkg.tar.gz" | cut -d' ' -f1)
+  want=$(awk -v n="codex-package-$CODEX_TARGET.tar.gz" '$2==n || $2=="*"n {print $1}' "$tmp/SHA256SUMS")
+  if [[ "$got" != "${digest#sha256:}" || "$got" != "$want" ]]; then
+    warn "codex: sha256 mismatch (file $got, API ${digest#sha256:}, SHA256SUMS ${want:-none}) — refusing"; rm -rf "$tmp"; return 1
+  fi
+  codex_archive_safe "$tmp/pkg.tar.gz" || { rm -rf "$tmp"; return 1; }
+  # Stage beside the final location (same filesystem) so the move is atomic.
+  stage=$(mktemp -d "$CODEX_ROOT/releases/.stage.XXXXXX") || { rm -rf "$tmp"; return 1; }
+  tar -xzf "$tmp/pkg.tar.gz" -C "$stage" --no-same-owner --no-same-permissions || { warn "codex: extract failed"; rm -rf "$tmp" "$stage"; return 1; }
+  if [[ ! -x "$stage/bin/codex" || ! -x "$stage/bin/codex-code-mode-host" || ! -f "$stage/codex-package.json" ]] \
+     || [[ "$(jq -r .version "$stage/codex-package.json" 2>/dev/null)" != "$ver" ]]; then
+    warn "codex: package incomplete or version mismatch — keeping the current install"; rm -rf "$tmp" "$stage"; return 1
+  fi
+  # Prove the new binary runs before anything points at it.
+  "$stage/bin/codex" --version >/dev/null 2>&1 || { warn "codex: new binary won't run — keeping the current install"; rm -rf "$tmp" "$stage"; return 1; }
   rm -rf "$tmp"
-  echo "    now $("$bin" --version 2>/dev/null) · previous kept at $bin.bak (~$(du -h "$bin.bak" | cut -f1), delete when happy)"
+  # An existing dir for this version is reused only if it is complete.
+  if [[ -x "$dest/bin/codex-code-mode-host" ]]; then rm -rf "$stage"; else rm -rf "$dest"; mv -T "$stage" "$dest" || { rm -rf "$stage"; warn "codex: install failed"; return 1; }; fi
+  prev=$(readlink "$CODEX_ROOT/current" 2>/dev/null)
+  [[ "$prev" == "$dest" ]] && prev=
+  ln -sfn "$dest" "$CODEX_ROOT/current.new" && mv -T "$CODEX_ROOT/current.new" "$CODEX_ROOT/current" || { warn "codex: could not move current"; return 1; }
+  # One-time migration from the lone-binary install: a regular file in the way.
+  if [[ -e "$HOME/.local/bin/codex" && ! -L "$HOME/.local/bin/codex" ]]; then
+    mv -f "$HOME/.local/bin/codex" "$HOME/.local/bin/codex.single-binary.bak"
+  fi
+  ln -sfn "$CODEX_ROOT/current/bin/codex" "$HOME/.local/bin/codex"
+  # Keep the active release and the one it replaced; drop older ones.
+  for old in "$CODEX_ROOT"/releases/*/; do
+    old=${old%/}; [[ "$old" == "$dest" || "$old" == "$prev" ]] || rm -rf "$old"
+  done
+  echo "    now $("$HOME/.local/bin/codex" --version 2>/dev/null)${prev:+ · previous release kept; roll back: ln -sfn $prev $CODEX_ROOT/current}"
 }
 
 apply_standalone() {
