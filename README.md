@@ -167,3 +167,18 @@ Only register for `x-scheme-handler/http` and `x-scheme-handler/https`. Do **not
 - `text/html` / `application/xhtml+xml` — would intercept any HTML file opened by any app
 - `x-scheme-handler/about` — browsers' internal `about:` URLs (Electron apps use these too)
 - `x-scheme-handler/unknown` — the catch-all fallback for unknown URL schemes; intercepts updater/IPC URLs from Electron apps (e.g. Discord), causing stuck popups and unwanted browser launches on file downloads
+
+## code-open
+
+Opens files in VSCode together with their project folder (the nearest ancestor holding a `.ai`, else the file's directory), so a terminal or AI session started there gets that folder as cwd. `code-open --sync` makes it the default app for a user-editable set of extensions.
+
+### Install
+
+```bash
+ln -s ~/dev/frznn/linux-scripts/utils/code-open.sh ~/.local/bin/code-open
+code-open --sync
+```
+
+The first sync writes `~/.config/code-open/extensions` (one extension per line, no dot, `#` comments) with common code and Markdown extensions, then generates `~/.local/share/applications/vscode-scope.desktop` and sets the defaults. Edit the list and run `code-open --sync` again to apply it; an extension removed from the list is released.
+
+Associations are per MIME type, so an extension is resolved through the system MIME database. One that resolves to `text/plain` or to a video, audio or image type is skipped with a warning, since claiming it would capture every plain-text file or a media class.
