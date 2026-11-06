@@ -5,6 +5,9 @@
 #   code-open FILE...   open each file in the window of its project folder: the
 #                       nearest ancestor holding a `.ai` (a context scope), else
 #                       the file's own directory
+#   code-open --url URL open a vscode://file/<path>[:line[:col]] link the same way
+#                       (what a chat link click runs); any other vscode:// URL is
+#                       passed to VSCode's own handler
 #   code-open --sync    make VSCode the default app for the extensions listed in
 #                       ~/.config/code-open/extensions (one per line, no dot,
 #                       `#` comments); writes the config with defaults if absent
@@ -16,6 +19,7 @@
 CONF=${XDG_CONFIG_HOME:-$HOME/.config}/code-open/extensions
 APPS=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 ENTRY=vscode-scope.desktop
+URL_ENTRY=vscode-url.desktop
 MIMEAPPS=${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list
 DEFAULT_EXTS='md markdown sh bash zsh py js mjs ts tsx jsx json yaml yml toml rs go c h cpp hpp java rb php lua sql css scss'
 
@@ -35,6 +39,26 @@ open_files() {
     f=$(realpath -s -- "$f") || continue
     /usr/bin/code "$(scope_of "$(dirname -- "$f")")" -g "$f"
   done
+}
+
+# open_url URL — vscode://file/<path>[:line[:col]] opens like open_files with the
+# position kept; every other vscode:// URL (auth callbacks, extension installs)
+# goes to the stock handler untouched.
+open_url() {
+  local url=$1 rest path pos=
+  if [[ $url != vscode://file/* ]]; then
+    exec /usr/share/code/code --open-url "$url"
+  fi
+  rest=${url#vscode://file}
+  rest=${rest%%[?#]*}
+  rest=$(printf '%b' "${rest//%/\\x}")        # URL-decode
+  if [[ $rest =~ ^(.*[^/]):([0-9]+(:[0-9]+)?)$ ]]; then
+    path=${BASH_REMATCH[1]} pos=:${BASH_REMATCH[2]}
+  else
+    path=$rest
+  fi
+  path=$(realpath -s -- "$path") || exit 1
+  /usr/bin/code "$(scope_of "$(dirname -- "$path")")" -g "$path$pos"
 }
 
 sync_associations() {
@@ -72,14 +96,28 @@ Categories=Utility;TextEditor;Development;
 MimeType=$(IFS=';'; echo "${mimes[*]};")
 NoDisplay=true
 EOT
+  cat > "$APPS/$URL_ENTRY" <<EOT
+[Desktop Entry]
+Name=VS Code (links, file + folder)
+Comment=Open vscode://file links in the window of the file's project folder
+Exec=$HOME/.local/bin/code-open --url %u
+Icon=vscode
+Type=Application
+Terminal=false
+Categories=Utility;TextEditor;Development;
+MimeType=x-scheme-handler/vscode;
+NoDisplay=true
+EOT
   # drop defaults from an earlier sync so a removed extension is released
   [[ -f $MIMEAPPS ]] && sed -i "/^[^=]*=$ENTRY;\?\$/d" "$MIMEAPPS"
   update-desktop-database "$APPS"
   (( ${#mimes[@]} )) && xdg-mime default "$ENTRY" "${mimes[@]}"
+  xdg-mime default "$URL_ENTRY" x-scheme-handler/vscode
   echo "VSCode is the default for: ${mimes[*]}"
 }
 
 case $1 in
   --sync) sync_associations ;;
+  --url)  open_url "$2" ;;
   *)      open_files "$@" ;;
 esac
