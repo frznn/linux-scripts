@@ -42,7 +42,9 @@
 #
 # NOTES
 #   * APT reads the package lists as-is; `apt-daily.timer` refreshes them ~daily.
-#     Applying runs `sudo apt-get update` first, so an apply is never stale.
+#     Applying runs `sudo apt-get update` first, so an apply is never stale, then a
+#     simulated upgrade (`apt-get -s`): a dependency problem stops it before anything
+#     is installed and names the blocking packages. Output: ~/.cache/update-all/apt-last.log.
 #   * npm targets are ENGINE-AWARE: the newest version whose engines.node your
 #     node actually satisfies, not blindly @latest (node 20 cannot run npm 12).
 #   * The --notify notification is CLICKABLE: clicking its body runs update-all
@@ -426,13 +428,49 @@ check_apt() {
   note "package lists last refreshed ${age}h ago (apt-daily.timer)"
 }
 
+# Pull the dependency-problem report out of an apt log: the "unmet
+# dependencies" header plus the indented lines naming each blocking package.
+apt_blockers() {
+  awk '/^The following packages have unmet dependencies:/ {on=1}
+       on && /^(E:|0 upgraded|The following (NEW|packages will))/ {on=0}
+       on' "$1" | head -n 40
+}
+
+# Show why apt failed and what to try. The fix is only suggested, never run:
+# `apt-get -f install` may remove packages, and that is the operator's call.
+apt_explain() {
+  local log="$1" blockers
+  blockers=$(apt_blockers "$log")
+  if [[ -n "$blockers" ]]; then
+    printf '%s\n' "$blockers" | sed 's/^/    /'
+  else
+    tail -n 8 "$log" | sed 's/^/    /'
+  fi
+  note "full apt output: $log"
+  note "to repair: sudo apt-get -f install   (held packages: apt-mark showhold)"
+}
+
 apply_apt() {
   section "APT — applying"
-  if sudo apt-get update -q && sudo apt-get full-upgrade -y; then
+  mkdir -p "$CACHE_DIR" || true
+  local log="$CACHE_DIR/apt-last.log"
+  : > "$log"
+  # Refresh the lists, then simulate the upgrade: a dependency problem shows up
+  # here, before anything is installed, so a failure never leaves a half-done
+  # upgrade behind.
+  sudo apt-get update -q 2>&1 | tee -a "$log"
+  if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+    warn "apt update failed"; apt_explain "$log"; FAILED=true; return
+  fi
+  if ! sudo apt-get -s full-upgrade >>"$log" 2>&1; then
+    warn "apt cannot upgrade — nothing was installed"; apt_explain "$log"; FAILED=true; return
+  fi
+  sudo apt-get full-upgrade -y 2>&1 | tee -a "$log"
+  if [[ ${PIPESTATUS[0]} -eq 0 ]]; then
     ok "apt done"
     note "run 'sudo apt autoremove' separately if you want orphans purged"
   else
-    warn "apt failed"; FAILED=true
+    warn "apt failed"; apt_explain "$log"; FAILED=true
   fi
 }
 
