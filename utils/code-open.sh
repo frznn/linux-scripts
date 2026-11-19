@@ -15,12 +15,17 @@
 # Associations are per MIME type, so --sync resolves each extension through the
 # system MIME database; an extension that would capture a whole media class or
 # every plain-text file is skipped with a warning.
+#
+# Opening refuses, with a notification, while the running VSCode is a build a
+# package upgrade has replaced: such an instance answers with an empty window.
 
 CONF=${XDG_CONFIG_HOME:-$HOME/.config}/code-open/extensions
 APPS=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 ENTRY=vscode-scope.desktop
 URL_ENTRY=vscode-url.desktop
 MIMEAPPS=${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list
+CODE_BIN=/usr/share/code/code   # the Electron binary every VSCode process runs
+CODE_PKG=/usr/share/code/resources/app/package.json   # holds the installed version
 DEFAULT_EXTS='md markdown sh bash zsh py js mjs ts tsx jsx json yaml yml toml rs go c h cpp hpp java rb php lua sql css scss'
 
 scope_of() {
@@ -32,8 +37,47 @@ scope_of() {
   printf '%s\n' "$1"
 }
 
+# refuse_stale_instance — stop before handing off to a VSCode that a package
+# upgrade replaced while it ran. Its main process keeps serving the IPC socket
+# (the socket name carries only the first four characters of the version, so a
+# 1.146 instance answers a 1.147 CLI), accepts the request, and opens a window
+# with no folder and no file, saying nothing. A replaced binary shows in
+# /proc/<pid>/exe with a " (deleted)" suffix; only a restart of VSCode cures it.
+#
+# Only the process that will receive the request counts, so the check asks which
+# process listens on the socket the CLI is about to dial, rather than judging
+# every running `code`. VSCode names that socket (ipc.net.ts):
+#   $XDG_RUNTIME_DIR/vscode-<sha256(user-data dir)[0:8]>-<version[0:4]>-main.sock
+# or, with no XDG_RUNTIME_DIR, <user-data dir>/<version[0:4]>-main.sock; the
+# user-data dir is resolved from this process's environment as the CLI resolves
+# it (userDataPath.ts: path.resolve, which keeps symlinks, hence realpath -s).
+# Anything it cannot establish lets the open go ahead.
+refuse_stale_instance() {
+  local data ver sock pid msg
+  [[ -n ${VSCODE_PORTABLE:-} ]] && return     # portable: socket lives elsewhere
+  command -v ss >/dev/null || return
+  data=$(realpath -ms -- "${VSCODE_APPDATA:-${XDG_CONFIG_HOME:-$HOME/.config}}/Code")
+  ver=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$CODE_PKG" 2>/dev/null | head -n1)
+  [[ -n $ver ]] || return
+  if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+    sock=$XDG_RUNTIME_DIR/vscode-$(printf '%s' "$data" | sha256sum | cut -c1-8)-${ver:0:4}-main.sock
+  else
+    sock=$data/${ver:0:4}-main.sock
+  fi
+  [[ -S $sock ]] || return                     # no instance: the CLI starts one
+  # the listener's pid, from `users:(("code",pid=N,fd=M))`; the socket path is
+  # matched as a whole field so a longer name sharing the prefix cannot match
+  pid=$(ss -xlpH 2>/dev/null | awk -v s="$sock" '$5 == s { if (match($0, /pid=[0-9]+/)) print substr($0, RSTART + 4, RLENGTH - 4); exit }')
+  [[ -n $pid && $(readlink "/proc/$pid/exe" 2>/dev/null) == "$CODE_BIN (deleted)" ]] || return
+  msg="VSCode was upgraded while running (pid $pid runs the replaced build); quit and restart it, then open the link again"
+  echo "code-open: $msg" >&2
+  command -v notify-send >/dev/null && notify-send -i vscode 'code-open' "$msg"
+  exit 1
+}
+
 open_files() {
   local f
+  refuse_stale_instance
   for f in "$@"; do
     # -s: keep symlinks unresolved, since a scope's `.ai` is itself a link into the state
     f=$(realpath -s -- "$f") || continue
@@ -58,6 +102,7 @@ open_url() {
     path=$rest
   fi
   path=$(realpath -s -- "$path") || exit 1
+  refuse_stale_instance
   /usr/bin/code "$(scope_of "$(dirname -- "$path")")" -g "$path$pos"
 }
 

@@ -201,3 +201,5 @@ code-open --sync
 The first sync writes `~/.config/code-open/extensions` (one extension per line, no dot, `#` comments) with common code and Markdown extensions, then generates `~/.local/share/applications/vscode-scope.desktop` and sets the defaults. Edit the list and run `code-open --sync` again to apply it; an extension removed from the list is released.
 
 Associations are per MIME type, so an extension is resolved through the system MIME database. One that resolves to `text/plain` or to a video, audio or image type is skipped with a warning, since claiming it would capture every plain-text file or a media class.
+
+While the VSCode instance that would receive the request (the process listening on the CLI's IPC socket) is a build that a package upgrade has replaced, opening refuses with a notification to restart VSCode: such an instance still accepts the request but opens an empty window.
