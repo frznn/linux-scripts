@@ -162,7 +162,8 @@ fi
 [ ${#B_NAME[@]} -gt 0 ] || lp_error "None of the browsers listed is installed."
 
 # --- profile pickers -------------------------------------------------------------
-# Each prints the hidden key of the chosen row: "p:<profile>".
+# Each prints the hidden key of the chosen row: "p:<profile>", "guest",
+# "private" or "running".
 pick_list() {  # <title> <height> <key> <label> ...
   local title=$1 h=$2
   shift 2
@@ -184,12 +185,12 @@ pick_chromium_profile() {  # <name> <folder>
   for e in "${entries[@]}"; do
     args+=("p:${e%%|*}" "${e#*|}")
   done
-  pick_list "Open in $1" 500 "${args[@]}"
+  pick_list "Open in $1" 500 "${args[@]}" guest "Guest"
 }
 
 # True when this Firefox-family browser already runs. -P cannot choose a profile
-# then (the running instance takes the URL), so the URL goes straight to it.
-# A flatpak is found by its application id, anything else by the
+# then (the running instance takes the URL), so the list offers the running
+# window instead. A flatpak is found by its application id, anything else by the
 # command's own name.
 firefox_running() {  # <words of the command...>
   if flatpak_parse "$@"; then
@@ -203,7 +204,7 @@ pick_firefox_profile() {  # <name> <folder> <words of the command...>
   local title="Open in $1" ini="$2/profiles.ini" n names args=()
   shift 2
   if firefox_running "$@"; then
-    printf 'running\n'
+    pick_list "$title" 200 running "Running window" private "Private"
     return
   fi
   mapfile -t names < <(
@@ -213,7 +214,7 @@ pick_firefox_profile() {  # <name> <folder> <words of the command...>
   for n in "${names[@]}"; do
     args+=("p:$n" "$n")
   done
-  pick_list "$title" 320 "${args[@]}"
+  pick_list "$title" 320 "${args[@]}" private "Private"
 }
 
 # --- choose and open ---------------------------------------------------------------
@@ -239,18 +240,45 @@ if [ "$LP_DEDUPE" -eq 1 ] && [ -r "$LP_STATE/current" ]; then
   fi
 fi
 
+# open_private <words of the command...>: Firefox's --private-window takes one
+# URL and opens any further ones in a normal window, so each URL gets a launch
+# of its own. With one URL (or none) that is a plain exec. With several, the
+# first launch may start the browser, so the rest wait (up to 10 s) until its
+# process exists. That is not yet the moment it accepts remote calls: a launch
+# made before then relies on Firefox's startup lock, which holds a second
+# startup until the first instance is up and then hands the URL to it.
+open_private() {
+  local u n
+  if [ ${#URL_ARGS[@]} -le 1 ]; then
+    exec "$@" --private-window "${URL_ARGS[@]}"
+  fi
+  for u in "${URL_ARGS[@]}"; do
+    if firefox_running "$@"; then
+      "$@" --private-window "$u" >/dev/null 2>&1 || true
+    else
+      setsid -f "$@" --private-window "$u" >/dev/null 2>&1 </dev/null
+      for n in $(seq 50); do
+        firefox_running "$@" && break
+        sleep 0.2
+      done
+    fi
+  done
+}
+
 read -ra cmd <<<"${B_CMD[$i]}"
 case "${B_FAMILY[$i]}" in
   chromium)
     key=$(pick_chromium_profile "${B_NAME[$i]}" "${B_DIR[$i]}") || exit 0
     case "$key" in
-      p:?*) exec "${cmd[@]}" --profile-directory="${key#p:}" "${URL_ARGS[@]}" ;;
+      guest) exec "${cmd[@]}" --guest "${URL_ARGS[@]}" ;;
+      p:?*)  exec "${cmd[@]}" --profile-directory="${key#p:}" "${URL_ARGS[@]}" ;;
     esac
     ;;
   firefox)
     key=$(pick_firefox_profile "${B_NAME[$i]}" "${B_DIR[$i]}" "${cmd[@]}") || exit 0
     case "$key" in
       running) exec "${cmd[@]}" "${URL_ARGS[@]}" ;;
+      private) open_private "${cmd[@]}" ;;
       p:?*)    exec "${cmd[@]}" -P "${key#p:}" "${URL_ARGS[@]}" ;;
     esac
     ;;
