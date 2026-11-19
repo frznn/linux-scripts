@@ -166,12 +166,12 @@ Without the file the built-in list is Firefox and Chrome (`google-chrome`, `~/.c
    ```
    Replace `USER` with your username (or use `$HOME` expanded at install time).
 
-3. Refresh the desktop database and set as default:
+3. Refresh the desktop database and set it as the http(s) handler:
    ```bash
    update-desktop-database ~/.local/share/applications/
-   xdg-settings set default-web-browser link-picker.desktop
    xdg-mime default link-picker.desktop x-scheme-handler/http x-scheme-handler/https
    ```
+   Do not use `xdg-settings set default-web-browser`: it also makes the entry the default for `text/html`, `x-scheme-handler/about` and `x-scheme-handler/unknown`, whatever its `MimeType` declares, which is exactly what the next section warns against. Desktops take the http handler as the default browser, so `xdg-mime` is enough. If you ran it already, delete the `text/html=link-picker.desktop`, `x-scheme-handler/about=link-picker.desktop` and `x-scheme-handler/unknown=link-picker.desktop` lines from `~/.config/mimeapps.list`.
 
 4. Verify:
    ```bash
@@ -183,9 +183,20 @@ Without the file the built-in list is Firefox and Chrome (`google-chrome`, `~/.c
 
 Only register for `x-scheme-handler/http` and `x-scheme-handler/https`. Do **not** add:
 
-- `text/html` / `application/xhtml+xml` — would intercept any HTML file opened by any app
+- `text/html` / `application/xhtml+xml` — would intercept any HTML file opened by any app (`text/html` is an opt-in, below, for those who want that)
 - `x-scheme-handler/about` — browsers' internal `about:` URLs (Electron apps use these too)
 - `x-scheme-handler/unknown` — the catch-all fallback for unknown URL schemes; intercepts updater/IPC URLs from Electron apps (e.g. Discord), causing stuck popups and unwanted browser launches on file downloads
+
+### Optional: open local HTML files through the picker
+
+If you want local `.html` files to get the browser and profile choice too, add `text/html;` to the entry's `MimeType` (`MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;`) and make it the default for that type:
+
+```bash
+update-desktop-database ~/.local/share/applications/
+xdg-mime default link-picker.desktop text/html
+```
+
+The cost: every HTML file that any application opens goes through the picker first, including a file manager's double-click, a mail attachment, a saved report or documentation opened with `xdg-open`, so each one asks before it opens. To undo it, remove `text/html;` from `MimeType` and set `text/html` back to your browser's entry with `xdg-mime default <browser>.desktop text/html`. `about` and `unknown` have no such opt-in.
 
 ## code-open
 
