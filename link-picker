@@ -36,10 +36,6 @@ if [ $# -eq 1 ]; then
   printf '%s %s %s\n' "$$" "$lp_now" "$1" > "$LP_STATE/current"
   flock -u 9
 fi
-BRAVE_BIN="/usr/bin/brave-browser"
-BRAVE_LOCAL_STATE="$HOME/.config/BraveSoftware/Brave-Browser/Local State"
-FIREFOX_BIN="/usr/bin/firefox"
-FIREFOX_PROFILES_INI="$HOME/.mozilla/firefox/profiles.ini"
 
 # Geometry "WxH+X+Y" centered on the primary monitor (or first connected if no primary).
 # NB: uses bash regex, not awk's 3-arg match() -- that is a gawk extension and
@@ -56,43 +52,183 @@ geom() {
     $(( BASH_REMATCH[4] + (BASH_REMATCH[2] - h) / 2 ))
 }
 
-pick_brave_profile() {
-  mapfile -t entries < <(
-    jq -r '.profile.info_cache | to_entries[] | "\(.key)|\(.value.name)"' \
-      "$BRAVE_LOCAL_STATE" | sort -t'|' -k2,2
-  )
-  local args=() e
-  for e in "${entries[@]}"; do
-    args+=("${e%%|*}" "${e#*|}")
+# --- the browsers ---------------------------------------------------------------
+# The browsers offered come from a file, one per line, fields split by "|":
+#   name | family | profile folder | command
+# Family "chromium" reads its profiles from "<folder>/Local State" and opens one
+# with --profile-directory; family "firefox" reads "<folder>/profiles.ini" and
+# opens one with -P. The command is split into words and never run through a
+# shell, so a line cannot smuggle shell syntax; only a leading "~/" is expanded
+# in the folder. A browser whose command is not installed is left out, so one
+# file can serve hosts that lack some of its browsers. With no file the built-in
+# list is used; a file replaces it rather than adding to it, so it also sets the
+# order and can drop a default.
+LP_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/link-picker/browsers"
+LP_DEFAULTS='Firefox | firefox  | ~/.mozilla/firefox      | firefox
+Chrome  | chromium | ~/.config/google-chrome | google-chrome'
+
+B_NAME=(); B_FAMILY=(); B_DIR=(); B_CMD=()
+
+lp_error() {
+  yad --image=dialog-error --title="link-picker" --text="$1" --button=OK:0 \
+    --geometry="$(geom 460 140)" 2>/dev/null || printf 'link-picker: %s\n' "$1" >&2
+  exit 1
+}
+
+# flatpak_parse <words of a command...>: reads a flatpak command, which must
+# have the form "flatpak run [--option[=value] ...] <app id> [args ...]".
+# Sets FP_APP to the app id and FP_INFO to the arguments that make
+# "flatpak info" ask about that same copy of the app: the installation
+# (--user, --system, --installation=), --arch= and the branch (--branch=,
+# given to info as its second argument). Returns 0 for such a command, 1 for a
+# command that is not flatpak, 2 for a flatpak command in any other form.
+# Only "--option=value" is accepted, because the parser cannot know which
+# options take a separate value; the reverse-DNS check on the app id is what
+# catches "--branch stable" (it would make "stable" the app id).
+FP_APP=""; FP_INFO=()
+flatpak_parse() {
+  local branch="" sel=()
+  FP_APP=""; FP_INFO=()
+  [ "$(basename "$1")" = flatpak ] || return 1
+  [ "${2:-}" = run ] || return 2
+  shift 2
+  while [ $# -gt 0 ] && [ "${1:0:1}" = "-" ]; do
+    case "$1" in
+      --user|--system|--installation=?*|--arch=?*) sel+=("$1") ;;
+      --branch=?*) branch=${1#--branch=} ;;
+    esac
+    shift
   done
+  [ $# -gt 0 ] || return 2
+  [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z_][A-Za-z0-9_-]*){2,}$ ]] || return 2
+  FP_APP=$1
+  FP_INFO=("${sel[@]}" "$1")
+  if [ -n "$branch" ]; then FP_INFO+=("$branch"); fi
+  return 0
+}
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+# load_browsers <source label> <text>: fills the B_* arrays. A malformed line is
+# an error naming the line, never skipped: a typo would otherwise hide a browser.
+load_browsers() {
+  local src=$1 text=$2 n=0 line seps name family dir cmd words w rc
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=$(trim "$line")
+    if [ -z "$line" ] || [ "${line:0:1}" = "#" ]; then continue; fi
+    # Exactly four fields: counted by separators, since read drops an empty last one.
+    seps=${line//[^|]/}
+    name=""; family=""; dir=""; cmd=""
+    IFS='|' read -r name family dir cmd <<<"$line" || true
+    name=$(trim "$name"); family=$(trim "$family"); dir=$(trim "$dir"); cmd=$(trim "$cmd")
+    if [ ${#seps} -ne 3 ] || [ -z "$name" ] || [ -z "$dir" ] || [ -z "$cmd" ]; then
+      lp_error "$src, line $n: expected 'name | family | profile folder | command'."
+    fi
+    read -ra words <<<"$cmd"
+    # A trailing comment would otherwise reach the browser as URLs.
+    for w in "${words[@]}"; do
+      [ "${w:0:1}" = "#" ] && lp_error "$src, line $n: comments go on a line of their own."
+    done
+    case "$family" in
+      chromium|firefox) ;;
+      *) lp_error "$src, line $n: unknown family '$family' (chromium or firefox)." ;;
+    esac
+    if [ "${dir:0:2}" = "~/" ]; then dir="$HOME/${dir:2}"; fi
+    if flatpak_parse "${words[@]}"; then rc=0; else rc=$?; fi
+    if [ $rc -eq 2 ]; then
+      lp_error "$src, line $n: a flatpak command must read 'flatpak run [--option=value ...] <app id>'."
+    fi
+    command -v "${words[0]}" >/dev/null 2>&1 || continue
+    # "flatpak run <app>" is installed only if that copy of the app is, not merely flatpak.
+    if [ $rc -eq 0 ]; then
+      flatpak info "${FP_INFO[@]}" >/dev/null 2>&1 || continue
+    fi
+    B_NAME+=("$name"); B_FAMILY+=("$family"); B_DIR+=("$dir"); B_CMD+=("$cmd")
+  done <<<"$text"
+}
+
+if [ -e "$LP_CONFIG" ]; then
+  [ -r "$LP_CONFIG" ] || lp_error "$LP_CONFIG is not readable."
+  load_browsers "$LP_CONFIG" "$(cat "$LP_CONFIG")"
+else
+  load_browsers "built-in list" "$LP_DEFAULTS"
+fi
+[ ${#B_NAME[@]} -gt 0 ] || lp_error "None of the browsers listed is installed."
+
+# --- profile pickers -------------------------------------------------------------
+# Each prints the hidden key of the chosen row: "p:<profile>".
+pick_list() {  # <title> <height> <key> <label> ...
+  local title=$1 h=$2
+  shift 2
   yad --list \
-    --title="Open in Brave" --text="Profile:" \
-    --column="dir" --column="Profile" \
+    --title="$title" --text="Profile:" \
+    --column="key" --column="Profile" \
     --hide-column=1 --print-column=1 \
     --separator="" --no-headers \
-    --geometry="$(geom 380 500)" \
-    "${args[@]}" 2>/dev/null
+    --geometry="$(geom 380 "$h")" \
+    "$@" 2>/dev/null
 }
 
-pick_firefox_profile() {
+pick_chromium_profile() {  # <name> <folder>
+  local e entries args=()
+  mapfile -t entries < <(
+    jq -r '.profile.info_cache | to_entries[] | "\(.key)|\(.value.name)"' \
+      "$2/Local State" 2>/dev/null | sort -t'|' -k2,2
+  )
+  for e in "${entries[@]}"; do
+    args+=("p:${e%%|*}" "${e#*|}")
+  done
+  pick_list "Open in $1" 500 "${args[@]}"
+}
+
+# True when this Firefox-family browser already runs. -P cannot choose a profile
+# then (the running instance takes the URL), so the URL goes straight to it.
+# A flatpak is found by its application id, anything else by the
+# command's own name.
+firefox_running() {  # <words of the command...>
+  if flatpak_parse "$@"; then
+    flatpak ps --columns=application 2>/dev/null | grep -qxF -- "$FP_APP"
+  else
+    pgrep -x "$(basename "$1")" >/dev/null
+  fi
+}
+
+pick_firefox_profile() {  # <name> <folder> <words of the command...>
+  local title="Open in $1" ini="$2/profiles.ini" n names args=()
+  shift 2
+  if firefox_running "$@"; then
+    printf 'running\n'
+    return
+  fi
   mapfile -t names < <(
     awk '/^\[Profile/{flag=1} flag && /^Name=/{sub(/^Name=/,""); print; flag=0}' \
-      "$FIREFOX_PROFILES_INI" | sort
+      "$ini" 2>/dev/null | sort
   )
-  yad --list \
-    --title="Open in Firefox" --text="Profile:" \
-    --column="Profile" \
-    --separator="" --no-headers \
-    --geometry="$(geom 380 320)" \
-    "${names[@]}" 2>/dev/null
+  for n in "${names[@]}"; do
+    args+=("p:$n" "$n")
+  done
+  pick_list "$title" 320 "${args[@]}"
 }
 
-browser=$(yad --list \
+# --- choose and open ---------------------------------------------------------------
+rows=()
+for i in "${!B_NAME[@]}"; do
+  rows+=("$i" "${B_NAME[$i]}")
+done
+i=$(yad --list \
   --title="Open link" --text="Browser:" \
-  --column="Browser" \
+  --column="i" --column="Browser" \
+  --hide-column=1 --print-column=1 \
   --separator="" --no-headers \
-  --geometry="$(geom 280 230)" \
-  "Brave" "Firefox" 2>/dev/null) || exit 0
+  --geometry="$(geom 280 $(( 170 + 30 * ${#B_NAME[@]} )))" \
+  "${rows[@]}" 2>/dev/null) || exit 0
+[[ $i =~ ^[0-9]+$ ]] && [ "$i" -lt ${#B_NAME[@]} ] || exit 0
 
 # A later duplicate invocation may have supplied the complete URL.
 if [ "$LP_DEDUPE" -eq 1 ] && [ -r "$LP_STATE/current" ]; then
@@ -103,18 +239,20 @@ if [ "$LP_DEDUPE" -eq 1 ] && [ -r "$LP_STATE/current" ]; then
   fi
 fi
 
-case "$browser" in
-  Brave)
-    p=$(pick_brave_profile) || exit 0
-    [ -z "$p" ] && exit 0
-    exec "$BRAVE_BIN" --profile-directory="$p" "${URL_ARGS[@]}"
+read -ra cmd <<<"${B_CMD[$i]}"
+case "${B_FAMILY[$i]}" in
+  chromium)
+    key=$(pick_chromium_profile "${B_NAME[$i]}" "${B_DIR[$i]}") || exit 0
+    case "$key" in
+      p:?*) exec "${cmd[@]}" --profile-directory="${key#p:}" "${URL_ARGS[@]}" ;;
+    esac
     ;;
-  Firefox)
-    if pgrep -x firefox >/dev/null; then
-      exec "$FIREFOX_BIN" "${URL_ARGS[@]}"
-    fi
-    p=$(pick_firefox_profile) || exit 0
-    [ -z "$p" ] && exit 0
-    exec "$FIREFOX_BIN" -P "$p" "${URL_ARGS[@]}"
+  firefox)
+    key=$(pick_firefox_profile "${B_NAME[$i]}" "${B_DIR[$i]}" "${cmd[@]}") || exit 0
+    case "$key" in
+      running) exec "${cmd[@]}" "${URL_ARGS[@]}" ;;
+      p:?*)    exec "${cmd[@]}" -P "${key#p:}" "${URL_ARGS[@]}" ;;
+    esac
     ;;
 esac
+exit 0

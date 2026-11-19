@@ -116,14 +116,32 @@ suppresses the desktop notification, for callers that report for themselves (`up
 
 ## link-picker
 
-Per-click browser/profile chooser for opening links. Registers as the default web browser, then prompts for browser (Brave/Firefox) and profile via `yad`.
+Per-click browser/profile chooser for opening links. Registers as the default web browser, then prompts for a browser and one of its profiles via `yad`; a Firefox-family browser that is already running gets the link directly.
 
 ### Dependencies
 
 - `yad` (GTK dialog)
-- `jq` (parsing Brave's `Local State`)
+- `jq` (parsing a Chromium-family browser's `Local State`)
 - `xrandr` (centering the dialog on the primary monitor)
-- Brave (`/usr/bin/brave-browser`) and/or Firefox snap (`/snap/bin/firefox`) — adjust paths in the script if installed elsewhere
+- the browsers themselves, listed in the browsers file below
+
+### Browsers
+
+The browsers come from `~/.config/link-picker/browsers` (`$XDG_CONFIG_HOME` is honoured), one per line, exactly four fields separated by `|`; blank lines and lines starting with `#` are ignored, and a comment cannot follow a browser on its line:
+
+```
+# name   | family   | profile folder                                   | command
+Brave    | chromium | ~/.config/BraveSoftware/Brave-Browser            | brave-browser
+Chromium | chromium | ~/.var/app/org.chromium.Chromium/config/chromium | flatpak run org.chromium.Chromium
+Firefox  | firefox  | ~/.mozilla/firefox                               | firefox
+```
+
+- **family** — `chromium` reads profiles from `<folder>/Local State` and opens one with `--profile-directory`; `firefox` reads `<folder>/profiles.ini` and opens one with `-P`.
+- **command** — split into words, never run through a shell; a leading `~/` is expanded in the folder only.
+- A browser whose command is not installed is left out, so one file can serve several machines. For a flatpak that means the app itself: the command must read `flatpak run [--option=value …] <app id>` (options in the `=` form only; any other flatpak form is a malformed line), and `--user`, `--system`, `--installation=`, `--arch=` and `--branch=` select which installed copy must be present.
+- A malformed line is reported with its line number and nothing opens.
+
+Without the file the built-in list is Firefox and Chrome (`google-chrome`, `~/.config/google-chrome`); the file replaces that list, so it also sets the order.
 
 ### Install
 
