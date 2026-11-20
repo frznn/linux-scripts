@@ -137,6 +137,7 @@ Firefox  | firefox  | ~/.mozilla/firefox                               | firefox
 ```
 
 - **family** — `chromium` reads profiles from `<folder>/Local State` and opens one with `--profile-directory`, Guest with `--guest`; `firefox` reads `<folder>/profiles.ini` and opens one with `-P`, Private with `--private-window`.
+- With a Chromium-family browser, a link opens in a new window when the last window used in that profile is an installed app (a PWA window), even though the profile's normal window is open. The running browser chooses the window and a launch option cannot override it; using the profile's normal window once before clicking the link avoids it.
 - **command** — split into words, never run through a shell; a leading `~/` is expanded in the folder only.
 - A browser whose command is not installed is left out, so one file can serve several machines. For a flatpak that means the app itself: the command must read `flatpak run [--option=value …] <app id>` (options in the `=` form only; any other flatpak form is a malformed line), and `--user`, `--system`, `--installation=`, `--arch=` and `--branch=` select which installed copy must be present.
 - Private opens each URL in a private window of its own, since `--private-window` takes a single URL.
