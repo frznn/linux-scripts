@@ -4,7 +4,7 @@
 #
 #   code-open FILE...   open each file in the window of its project folder: the
 #                       nearest ancestor holding a `.ai` (a context scope), else
-#                       the file's own directory
+#                       the enclosing git repository, else the file's own directory
 #   code-open --url URL open a vscode://file/<path>[:line[:col]] link the same way
 #                       (what a chat link click runs); any other vscode:// URL is
 #                       passed to VSCode's own handler
@@ -34,6 +34,10 @@ scope_of() {
     [[ -e $dir/.ai ]] && { printf '%s\n' "$dir"; return; }
     dir=$(dirname -- "$dir")
   done
+  # No scope: a tree with no `.ai` of its own (the framework deployment) is still
+  # a project, so prefer its git root over the file's folder.
+  local top
+  top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) && [[ -n $top ]] && { printf '%s\n' "$top"; return; }
   printf '%s\n' "$1"
 }
 
