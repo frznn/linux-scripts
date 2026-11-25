@@ -56,7 +56,9 @@
 #     node actually satisfies, not blindly @latest (node 20 cannot run npm 12).
 #   * The --notify notification is CLICKABLE: clicking its body runs update-all
 #     in a terminal, where the usual prompt then decides what gets applied.
-#     Dismissing it with the X applies nothing. See send_notification().
+#     Dismissing it with the X applies nothing. It stays clickable until a later
+#     check replaces it or finds nothing pending, which closes it.
+#     See send_notification().
 #   * The notification collapses families that share a '-'-delimited prefix
 #     ("cosmic-panel", "cosmic-comp", ... -> "cosmic-* x7") so one big family
 #     cannot push every other name past the "+N more" cut. See group_names().
@@ -75,7 +77,6 @@ MAXLIST=10
 NOTIFY_MAXNAMES=5   # names listed per source in the desktop notification
 NOTIFY_GROUP_MIN=2  # collapse this many names sharing a '-' prefix into "prefix-* xN" (0/1 = off)
 NOTIFY_ACTION=true  # arm the click-to-run action on the notification
-NOTIFY_ACTION_TTL=23h        # how long the process listening for that click stays alive
 NOTIFY_UNIT=update-all-notify   # transient user unit it lives in
 # Terminal the click action opens. It must take the command to run as trailing
 # arguments; the value is word-split on purpose so flags can be included.
@@ -311,6 +312,15 @@ action_available() {  # can the notification be made clickable?
   return 0
 }
 
+# Ends the listener of the previous notification, which closes that notification
+# on its way out (see send_notification). A notification nothing listens to still
+# looks clickable, so the two never outlive each other.
+retire_notification() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl --user stop         "$NOTIFY_UNIT.service" >/dev/null 2>&1
+  systemctl --user reset-failed "$NOTIFY_UNIT.service" >/dev/null 2>&1
+}
+
 notify_plain() {  # fire-and-forget: no action, nothing left running
   # -t 0: never expire. This is a once-a-day reminder — a banner that vanishes after a
   # few seconds is missed unless you happen to be looking at the screen when the timer fires.
@@ -320,50 +330,62 @@ notify_plain() {  # fire-and-forget: no action, nothing left running
   notify-send -a "update-all" -i software-update-available -t 0 "$3" "$4" || true
 }
 
-send_notification() {
-  local summary="$1" body="$2" disp bus
+send_notification() {  # $1 summary, $2 body; the closing hint is added here
+  local summary="$1" body="$2" disp bus plain
   command -v notify-send >/dev/null 2>&1 || return 0
   disp="${DISPLAY:-:0}"
   bus="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+  plain="$body
 
-  if ! action_available; then notify_plain "$disp" "$bus" "$summary" "$body"; return 0; fi
+Run: update-all"
+  retire_notification
+
+  if ! action_available; then notify_plain "$disp" "$bus" "$summary" "$plain"; return 0; fi
 
   # cosmic-notifications draws NO action buttons — it advertises `actions` in
   # GetCapabilities and then ignores the labels — but it DOES deliver
   # ActionInvoked when the notification body is clicked, firing the first action.
   # So a single action named `default` means "click the notification to run this",
-  # while the X still dismisses without firing anything. (Probed 2026-09-05.)
+  # while the X still dismisses without firing anything.
   #
-  # Two measured facts force the shape below:
-  #   * `notify-send -A` implies --wait, and this daemon never emits
-  #     NotificationClosed — not on dismiss, not even on expiry — so the waiting
-  #     process would hang forever. It has to be time-bounded from outside.
-  #   * When ExecStart returns, systemd kills the rest of the service cgroup, so
-  #     a plain background child would die with the check. It needs its own unit.
-  # …and a third fact shapes the click handler: cosmic-term DOUBLE-FORKS and
-  # returns in ~5 ms, so a terminal started inside this unit is killed by the
-  # cgroup teardown the instant the waiter exits — it never draws. It therefore
-  # goes into a unit of its own with KillMode=process. That property must NOT be
-  # put on the waiter: stopping a waiter would then leave its notify-send behind,
-  # blocked forever on a NotificationClosed this daemon never sends.
-  systemctl --user stop         "$NOTIFY_UNIT.service" >/dev/null 2>&1
-  systemctl --user reset-failed "$NOTIFY_UNIT.service" >/dev/null 2>&1
+  # The click only works while the `notify-send` that sent the notification is
+  # still waiting, and the notification never expires (-t 0). So:
+  #   * the waiter gets a unit of its own, with no time limit: when ExecStart of
+  #     the check returns, systemd kills the rest of that service cgroup, so a
+  #     plain background child would die with it;
+  #   * whatever stops that unit (the next check, logout) also closes the
+  #     notification. -p prints the id to close first, and stdbuf makes it
+  #     readable while notify-send is still waiting.
+  # cosmic-term DOUBLE-FORKS and returns in ~5 ms, so a terminal started inside
+  # this unit is killed by the cgroup teardown the instant the waiter exits — it
+  # never draws. It therefore goes into a unit of its own with KillMode=process.
+  # That property must NOT be put on the waiter: stopping it would then leave its
+  # notify-send behind.
+  # systemd-run expands ${NAME} in the command it is given: no braces in there.
   # $4 (the terminal) is unquoted on purpose — it carries its own arguments.
   if systemd-run --user --quiet --collect --unit="$NOTIFY_UNIT" \
-       --property=RuntimeMaxSec="$NOTIFY_ACTION_TTL" \
        --setenv=DISPLAY="$disp" --setenv=DBUS_SESSION_BUS_ADDRESS="$bus" \
        bash -c '
-         a=$(notify-send -a "update-all" -i software-update-available -t 0 \
-               -A "default=$3" "$1" "$2") || exit 0
+         exec 3< <(exec stdbuf -oL notify-send -a "update-all" -i software-update-available \
+                     -t 0 -p -A "default=$3" "$1" "$2")
+         read -r id <&3 || exit 0
+         trap "timeout 5 gdbus call --session --dest org.freedesktop.Notifications \
+                 --object-path /org/freedesktop/Notifications \
+                 --method org.freedesktop.Notifications.CloseNotification $id >/dev/null 2>&1
+               exit 0" TERM
+         read -r a <&3 || exit 0
          [ "$a" = default ] || exit 0
          exec systemd-run --user --quiet --collect --property=KillMode=process \
               --description="update-all (from notification)" \
               $4 bash -lc "$5"
-       ' "$NOTIFY_UNIT" "$summary" "$body" "Update now" "$UPDATE_ALL_TERMINAL" \
+       ' "$NOTIFY_UNIT" "$summary" "$body
+
+Click this notification to update  ·  or run: update-all" "Update now" "$UPDATE_ALL_TERMINAL" \
          'update-all --cached; printf "\n[finished — press enter to close] "; read -r _'
   then return 0; fi
-  # transient unit refused (no user manager, name taken, …) — still notify
-  notify_plain "$disp" "$bus" "$summary" "$body"
+  # transient unit refused (no user manager, name taken, …) — still notify, with
+  # no promise of a click
+  notify_plain "$disp" "$bus" "$summary" "$plain"
 }
 
 # ── results cache ────────────────────────────────────────────────────────────
@@ -1050,6 +1072,13 @@ if (( TOTAL == 0 )); then
     printf "\033[1;33mNothing pending, but a check failed\033[0m — %s (see above)\n" "$(join_list ', ' "${unchecked[@]}")"
   else
     printf "\033[1;32mEverything is up to date.\033[0m\n"
+    # An earlier notification now names updates that are gone. Only a check of
+    # every source can tell; forgetting its fingerprint lets --only-new report
+    # the same set again if it comes back.
+    if $NOTIFY && (( ${#SOURCES[@]} == ${#ALL_SOURCES[@]} )); then
+      retire_notification
+      rm -f -- "$CACHE_DIR/last"
+    fi
   fi
   exit 0
 fi
@@ -1083,11 +1112,7 @@ if $NOTIFY; then
   # silent when the same number of different packages comes up
   fingerprint=$(printf '%s' "$body" | md5sum | cut -d' ' -f1)
   if ! $ONLY_NEW || [[ "$fingerprint" != "$(cat "$CACHE_DIR/last" 2>/dev/null)" ]]; then
-    hint="Run: update-all"
-    action_available && hint="Click this notification to update  ·  or run: update-all"
-    send_notification "$TOTAL update(s) available" "$body
-
-$hint"
+    send_notification "$TOTAL update(s) available" "$body"
   fi
   printf '%s' "$fingerprint" > "$CACHE_DIR/last"
 fi
