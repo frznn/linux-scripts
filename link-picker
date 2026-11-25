@@ -76,28 +76,69 @@ lp_error() {
 }
 
 # flatpak_parse <words of a command...>: reads a flatpak command, which must
-# have the form "flatpak run [--option[=value] ...] <app id> [args ...]".
-# Sets FP_APP to the app id and FP_INFO to the arguments that make
-# "flatpak info" ask about that same copy of the app: the installation
-# (--user, --system, --installation=), --arch= and the branch (--branch=,
-# given to info as its second argument). Returns 0 for such a command, 1 for a
-# command that is not flatpak, 2 for a flatpak command in any other form.
-# Only "--option=value" is accepted, because the parser cannot know which
-# options take a separate value; the reverse-DNS check on the app id is what
-# catches "--branch stable" (it would make "stable" the app id).
+# have the form "flatpak run [option ...] <app id> [args ...]", every option
+# one of flatpak run's own ("--" may end them), and an option that takes a
+# value written "--option=value" with the value not empty. Sets FP_APP to the
+# app id and FP_INFO to the arguments that make "flatpak info" ask about that
+# same copy of the app: the installation (--user or -u, --system,
+# --installation=), --arch= and the branch (--branch=, given to info as its
+# second argument). Returns 0 for such a command, 1 for a command that is not
+# flatpak, 2 for a flatpak command in any other form.
+# The parser has to know which options take a value: "--runtime
+# org.gnome.Platform org.x.Y" would otherwise read the runtime as the app id.
+# Requiring "=" for those keeps the table the only thing it must know; an
+# option missing from it, or a flag given "=value", is refused rather than
+# guessed at. The tables are flatpak run's documented options (--help-all) as
+# of flatpak 1.18, so a hidden deprecated one such as --no-desktop is refused;
+# "-h", "--help" and "--help-all" are left out because they run no app.
+FP_FLAGS=" user system devel log-session-bus log-system-bus log-a11y-bus
+  no-a11y-bus a11y-bus no-session-bus session-bus no-documents-portal
+  file-forwarding sandbox die-with-parent parent-expose-pids parent-share-pids
+  clear-env verbose ostree-verbose "
+FP_VALUED=" installation arch command cwd branch runtime runtime-version commit
+  runtime-commit parent-pid instance-id-fd app-path app-fd usr-path usr-fd
+  bind-fd ro-bind-fd share unshare share-if socket nosocket socket-if device
+  nodevice device-if allow disallow allow-if filesystem nofilesystem env
+  env-fd unset-env own-name talk-name no-talk-name system-own-name
+  system-talk-name system-no-talk-name a11y-own-name add-policy remove-policy
+  usb nousb usb-list usb-list-file persist "
+# One space around every name, so that " name " matches whole names only.
+FP_FLAGS=" $(printf '%s ' $FP_FLAGS)"
+FP_VALUED=" $(printf '%s ' $FP_VALUED)"
+# Short forms: each a flag, so they may be grouped ("-uv").
+FP_SHORT=" u d p v "
 FP_APP=""; FP_INFO=()
 flatpak_parse() {
-  local branch="" sel=()
+  local branch="" sel=() opt name value c i
   FP_APP=""; FP_INFO=()
   [ "$(basename "$1")" = flatpak ] || return 1
   [ "${2:-}" = run ] || return 2
   shift 2
   while [ $# -gt 0 ] && [ "${1:0:1}" = "-" ]; do
-    case "$1" in
-      --user|--system|--installation=?*|--arch=?*) sel+=("$1") ;;
-      --branch=?*) branch=${1#--branch=} ;;
+    opt=$1; shift
+    case "$opt" in
+      --) break ;;
+      --*=*)
+        name=${opt%%=*}; name=${name#--}; value=${opt#*=}
+        [[ $FP_VALUED == *" $name "* ]] && [ -n "$value" ] || return 2
+        case "$name" in
+          installation|arch) sel+=("$opt") ;;
+          branch) branch=$value ;;
+        esac ;;
+      --?*)
+        name=${opt#--}
+        [[ $FP_FLAGS == *" $name "* ]] || return 2
+        case "$name" in user|system) sel+=("$opt") ;; esac ;;
+      *)
+        # A group of short flags; "-" alone is not an option.
+        [ ${#opt} -gt 1 ] || return 2
+        for ((i = 1; i < ${#opt}; i++)); do
+          c=${opt:i:1}
+          [[ $FP_SHORT == *" $c "* ]] || return 2
+          # flatpak info knows no -u, so it gets the long form.
+          if [ "$c" = u ]; then sel+=(--user); fi
+        done ;;
     esac
-    shift
   done
   [ $# -gt 0 ] || return 2
   [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z_][A-Za-z0-9_-]*){2,}$ ]] || return 2
@@ -142,7 +183,7 @@ load_browsers() {
     if [ "${dir:0:2}" = "~/" ]; then dir="$HOME/${dir:2}"; fi
     if flatpak_parse "${words[@]}"; then rc=0; else rc=$?; fi
     if [ $rc -eq 2 ]; then
-      lp_error "$src, line $n: a flatpak command must read 'flatpak run [--option=value ...] <app id>'."
+      lp_error "$src, line $n: a flatpak command must read 'flatpak run [option ...] <app id>', with flatpak run's own options; options that take a value use the = form (--branch=stable)."
     fi
     command -v "${words[0]}" >/dev/null 2>&1 || continue
     # "flatpak run <app>" is installed only if that copy of the app is, not merely flatpak.
