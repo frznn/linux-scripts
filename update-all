@@ -4,15 +4,16 @@
 #
 # One place to see — and then choose to apply — pending updates across every
 # package manager on this box: APT, Flatpak (user + system), global npm
-# packages, hand-installed .debs that apt structurally cannot see, and
-# standalone tools that live outside every manager (claude / codex / grok).
+# packages, and software installed by hand that none of those will ever offer:
+# .debs with no apt repo (discord / proton-mail) and tools outside every
+# manager (claude / codex / grok).
 #
 # An optional essentials file names the software you want called out on its
 # own, pulled up out of whichever source it came from — see ESSENTIALS below.
 #
 # USAGE
 #   update-all                  # check everything, show how to apply, then prompt
-#   update-all npm deb          # only these sources (still prompts)
+#   update-all npm manual       # only these sources (still prompts)
 #   update-all --notify         # check + desktop notification (names what is pending)
 #   update-all --cached         # reuse the last check's results, however old (what a
 #                               # click on the notification runs) — no re-check
@@ -21,7 +22,7 @@
 #   update-all --only-new       # with --notify: notify only if the pending set changed
 #   update-all --no-action      # with --notify: don't arm the click-to-run action
 #
-#   Sources: apt  flatpak  npm  deb  standalone   (default: all)
+#   Sources: apt  flatpak  npm  manual   (default: all)
 #
 # Only a source with something to report gets a group: pending updates, a failed
 # check, or a warning. With none, the output is the closing line alone.
@@ -79,7 +80,7 @@ NOTIFY_UNIT=update-all-notify   # transient user unit it lives in
 # Terminal the click action opens. It must take the command to run as trailing
 # arguments; the value is word-split on purpose so flags can be included.
 UPDATE_ALL_TERMINAL="${UPDATE_ALL_TERMINAL:-cosmic-term --}"
-ALL_SOURCES=(apt flatpak npm deb standalone)
+ALL_SOURCES=(apt flatpak npm manual)
 # ESSENTIALS: one name per line, '#' comments, blank lines ignored. Globs work
 # ('linux-*'), matching is case-insensitive, and 'source:name' restricts an
 # entry to one source ('apt:code'). Names are the ones this script prints.
@@ -116,7 +117,7 @@ for arg in "$@"; do
     # only>" rather than /^# ─+$/: awk here is mawk, which counts BYTES, so the
     # + would bind to the last byte of the 3-byte ─ and never match.
     -h|--help)         awk 'NR==1{next} /^#/{ if ($0 ~ /^# [^a-zA-Z0-9]+$/) next; sub(/^# ?/,""); print; next } {exit}' "$0"; exit 0 ;;
-    apt|flatpak|npm|deb|standalone) SOURCES+=("$arg") ;;
+    apt|flatpak|npm|manual) SOURCES+=("$arg") ;;
     *) echo "update-all: unknown argument '$arg' (try --help)" >&2; exit 1 ;;
   esac
 done
@@ -141,8 +142,8 @@ declare -A COUNT=()      # source → number pending
 declare -A PENDING=()    # source → "name  old → new" lines (computed once, reused by apply)
 declare -A HOWTO=()      # source → the command to apply that source by hand
 declare -A ERRORS=()     # source → one line per lookup that failed
-declare -A TITLE=([apt]="APT" [flatpak]="Flatpak" [npm]="npm (global)" [deb]="Hand-installed .debs" [standalone]="Standalone")
-declare -A LABEL=([apt]="package(s) upgradable" [flatpak]="update(s)" [npm]="global package(s)" [deb]="package(s)" [standalone]="tool(s)")
+declare -A TITLE=([apt]="APT" [flatpak]="Flatpak" [npm]="npm (global)" [manual]="Installed by hand")
+declare -A LABEL=([apt]="package(s) upgradable" [flatpak]="update(s)" [npm]="global package(s)" [manual]="tool(s)")
 TOTAL=0
 FAILED=false
 
@@ -243,7 +244,7 @@ group_names() {  # stdin: one name per line → one "<count><TAB><display>" line
   # of the NOTIFY_MAXNAMES slots instead of burying every other name behind
   # "+N more" — on a 149-package apt day that is the difference between seeing
   # brave-browser and not. Order follows each group's first member. Names with
-  # no '-' (flatpak display names, most standalone tools) are never touched.
+  # no '-' (flatpak display names, most hand-installed tools) are never touched.
   local -a names=(); local -A cnt=() seen=(); local n key
   mapfile -t names
   (( ${#names[@]} )) || return 0
@@ -700,7 +701,7 @@ apply_npm() {
   $bad && FAILED=true || ok "npm done  (install scripts stayed disabled — global policy)"
 }
 
-# ── Hand-installed .debs ─────────────────────────────────────────────────────
+# ── Installed by hand: .debs ─────────────────────────────────────────────────
 # Packages installed from a downloaded .deb with no apt repo behind them: dpkg
 # knows the version, apt has no candidate newer than what's installed, so they
 # are invisible to `apt list --upgradable` forever. Each needs its own upstream
@@ -791,51 +792,27 @@ deb_pending() {
   fi
 }
 
-check_deb() {
-  collect deb "$(deb_pending)"
-  report deb || return 0
-  local hints=()
-  grep -q '^discord' <<<"${PENDING[deb]}" && hints+=("update-discord")
-  grep -q '^proton-mail' <<<"${PENDING[deb]}" && hints+=("update-all deb")
-  HOWTO[deb]=$(join_list '  ·  ' "${hints[@]:-}")
-  note "no apt repo behind these — apt will never offer them"
+apply_proton_mail() {
+  local url sha tmp rc=0
+  IFS=$'\t' read -r _ url sha < <(proton_feed)
+  [[ -n "$url" ]] || { warn "no download URL in the Proton feed"; return 1; }
+  tmp=$(mktemp -d)
+  if timeout 600 curl -fL# "$url" -o "$tmp/proton-mail.deb"; then
+    # The checksum ships in the same TLS-protected feed as the URL, so this
+    # guards against a truncated/corrupt download, not against a bad feed.
+    if [[ -n "$sha" ]] && ! echo "$sha  $tmp/proton-mail.deb" | sha512sum -c --status; then
+      warn "proton-mail: SHA512 mismatch — refusing to install"; rc=1
+    else
+      sudo dpkg -i "$tmp/proton-mail.deb" || { warn "proton-mail install failed"; rc=1; }
+    fi
+  else
+    warn "proton-mail download failed"; rc=1
+  fi
+  rm -rf "$tmp"
+  return $rc
 }
 
-apply_deb() {
-  section "Hand-installed .debs — applying"
-  local line name tmp url sha bad=false
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    name=${line%% *}
-    case "$name" in
-      discord)
-        echo "  → discord"
-        "$(find_update_discord)" || { warn "discord failed"; bad=true; }
-        ;;
-      proton-mail)
-        echo "  → proton-mail"
-        IFS=$'\t' read -r _ url sha < <(proton_feed)
-        if [[ -z "$url" ]]; then warn "no download URL in the Proton feed"; bad=true; continue; fi
-        tmp=$(mktemp -d)
-        if timeout 600 curl -fL# "$url" -o "$tmp/proton-mail.deb"; then
-          # The checksum ships in the same TLS-protected feed as the URL, so this
-          # guards against a truncated/corrupt download, not against a bad feed.
-          if [[ -n "$sha" ]] && ! echo "$sha  $tmp/proton-mail.deb" | sha512sum -c --status; then
-            warn "proton-mail: SHA512 mismatch — refusing to install"; bad=true
-          else
-            sudo dpkg -i "$tmp/proton-mail.deb" || { warn "proton-mail install failed"; bad=true; }
-          fi
-        else
-          warn "proton-mail download failed"; bad=true
-        fi
-        rm -rf "$tmp"
-        ;;
-    esac
-  done <<<"${PENDING[deb]}"
-  $bad && FAILED=true || ok "hand-installed .debs done"
-}
-
-# ── Standalone (installed outside every package manager) ────────────────────
+# ── Installed by hand: tools outside every package manager ──────────────────
 # RULE FOR THIS SECTION: ask the oracle the APPLY PATH uses. A check that reads
 # a different registry than the installer will silently disagree with it — see
 # the Proton channel bug (notes/update-all.md §4b) for how that fails: not with
@@ -898,18 +875,6 @@ standalone_pending() {
       check_failed "grok: update --check"
     fi
   fi
-}
-
-check_standalone() {
-  collect standalone "$(standalone_pending)"
-  report standalone || return 0
-  local hints=()
-  grep -q '^claude' <<<"${PENDING[standalone]}" && hints+=("claude update")
-  grep -q '^grok'   <<<"${PENDING[standalone]}" && hints+=("grok update")
-  grep -q '^codex'  <<<"${PENDING[standalone]}" && hints+=("update-all standalone")
-  HOWTO[standalone]=$(join_list '  ·  ' "${hints[@]:-}")
-  grep -q '^codex' <<<"${PENDING[standalone]}" && \
-    note "codex is the release package — 'codex update' can't self-update it, update-all installs the new release beside the old"
 }
 
 # codex is installed as the official release PACKAGE, not the lone binary: the
@@ -991,21 +956,48 @@ apply_codex() {
   echo "    now $("$HOME/.local/bin/codex" --version 2>/dev/null)${prev:+ · previous release kept; roll back: ln -sfn $prev $CODEX_ROOT/current}"
 }
 
-apply_standalone() {
-  section "Standalone — applying"
+# ── The `manual` source: both halves above, as one group ────────────────────
+manual_pending() {
+  deb_pending
+  standalone_pending
+}
+
+check_manual() {
+  collect manual "$(manual_pending)"
+  report manual || return 0
+  # One command per tool that has its own; the rest only update-all can install.
+  local hints=() list="${PENDING[manual]}"
+  grep -q '^discord ' <<<"$list" && hints+=("update-discord")
+  grep -q '^claude '  <<<"$list" && hints+=("claude update")
+  grep -q '^grok '    <<<"$list" && hints+=("grok update")
+  grep -qE '^(proton-mail|codex) ' <<<"$list" && hints+=("update-all manual")
+  HOWTO[manual]=$(join_list '  ·  ' "${hints[@]:-}")
+  note "installed outside apt, flatpak and npm — none of them will offer these"
+  grep -q '^codex ' <<<"$list" && \
+    note "codex is the release package — 'codex update' can't self-update it, update-all installs the new release beside the old"
+}
+
+apply_manual() {
+  section "Installed by hand — applying"
   local line name bin bad=false
-  while IFS= read -r line; do
+  # The list is read on fd 3: the installers run inside this loop, and one that
+  # reads stdin (a sudo or apt question) must get the terminal, not eat the
+  # remaining entries.
+  while IFS= read -r line <&3; do
     [[ -z "$line" ]] && continue
     name=${line%% *}
     echo "  → $name"
-    if [[ "$name" == codex ]]; then
-      apply_codex || { bad=true; }
-    else
-      bin=$(find_bin "$name") || continue
-      "$bin" update || { warn "$name update failed"; bad=true; }
-    fi
-  done <<<"${PENDING[standalone]}"
-  $bad && FAILED=true || ok "standalone done"
+    case "$name" in
+      discord)     "$(find_update_discord)" || { warn "discord failed"; bad=true; } ;;
+      proton-mail) apply_proton_mail || bad=true ;;
+      codex)       apply_codex || bad=true ;;
+      *)
+        bin=$(find_bin "$name") || continue
+        "$bin" update || { warn "$name update failed"; bad=true; }
+        ;;
+    esac
+  done 3<<<"${PENDING[manual]}"
+  $bad && FAILED=true || ok "manual done"
 }
 
 # ── run ──────────────────────────────────────────────────────────────────────

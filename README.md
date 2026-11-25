@@ -5,17 +5,17 @@ Useful scripts for Linux.
 ## update-all
 
 One report for every update source on this box — **APT**, **Flatpak** (user *and* system scope,
-apps and runtimes/extensions alike, all named), **global npm** packages, **hand-installed `.deb`s**
-that apt structurally cannot see, and **standalone** tools (`claude` / `codex` / `grok`) that no
-package manager tracks. Checking is read-only and needs no privileges; applying is always explicit.
+apps and runtimes/extensions alike, all named), **global npm** packages, and software **installed by
+hand** that none of those will ever offer: `.deb`s with no apt repo (Discord, Proton Mail) and tools
+no package manager tracks (`claude` / `codex` / `grok`). Checking is read-only and needs no privileges; applying is always explicit.
 Only a source with something to report is shown (pending updates, a failed check, or an unsupported
 npm global); when there is none, the output is the closing "Everything is up to date." line.
 
-Sources: `apt` · `flatpak` · `npm` · `deb` · `standalone`
+Sources: `apt` · `flatpak` · `npm` · `manual`
 
 ```bash
 update-all                  # check everything, show how to apply, then prompt
-update-all npm deb          # only these sources (still prompts)
+update-all npm manual       # only these sources (still prompts)
 update-all --notify         # check + desktop notification; never prompts
 update-all --full           # don't truncate long lists
 update-all --cached         # replay the last check's results, however old (no re-check)
@@ -45,7 +45,7 @@ For a daily check + notification, a **user** systemd timer (no root — the chec
 ```ini
 # ~/.config/systemd/user/update-all.service
 [Unit]
-Description=Check for pending updates (apt, flatpak, npm, deb, standalone) and notify
+Description=Check for pending updates (apt, flatpak, npm, manual) and notify
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/update-all --notify
@@ -67,7 +67,10 @@ WantedBy=timers.target
 systemctl --user daemon-reload && systemctl --user enable --now update-all.timer
 ```
 
-### The `deb` source
+### The `manual` source
+
+One group, one pending list and one apply step for everything installed by hand. Each entry has its
+own upstream version lookup and its own installer, so applying the group runs `sudo` for the `.deb`s.
 
 Packages installed from a downloaded `.deb` with no repo behind them (here: Discord, Proton Mail)
 are invisible to `apt list --upgradable` forever — `apt-cache policy` shows the candidate equal to
@@ -76,7 +79,7 @@ what is installed. Each needs its own upstream version oracle: Discord delegates
 `version.json`. Applying verifies Proton's published SHA512 before `dpkg -i` — which guards a
 truncated download, not a compromised feed, since URL and checksum come from the same place.
 
-Find new members of that class with:
+Find new `.deb`s of that class with:
 
 ```bash
 comm -23 <(dpkg-query -W -f='${Package}\n' | sort) \
