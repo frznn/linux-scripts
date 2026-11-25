@@ -1031,7 +1031,11 @@ fi
 
 PENDING_SOURCES=()
 SUMMARY=()
+# Everything offered or applied below derives from these two lists. A cached
+# result may hold more sources than this run asked for, so they take only the
+# asked ones: an unasked source must not be one Enter away from being applied.
 for s in "${ALL_SOURCES[@]}"; do
+  wants "$s" || continue
   (( ${COUNT[$s]:-0} > 0 )) && { PENDING_SOURCES+=("$s"); SUMMARY+=("$s: ${COUNT[$s]}"); }
 done
 
