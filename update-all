@@ -23,6 +23,9 @@
 #
 #   Sources: apt  flatpak  npm  deb  standalone   (default: all)
 #
+# Only a source with something to report gets a group: pending updates, a failed
+# check, or a warning. With none, the output is the closing line alone.
+#
 # The check is READ-ONLY and needs no privileges. Applying only ever happens
 # after an answer at the prompt — plain Enter means "apply everything" — and
 # the prompt appears only on a terminal, so an unattended run (the timer)
@@ -128,6 +131,10 @@ section() { printf "\n\033[1m━━━ %s ━━━\033[0m\n\n" "$1"; }
 note()    { printf "  \033[2m%s\033[0m\n" "$1"; }
 ok()      { printf "  \033[32m✓\033[0m %s\n" "$1"; }
 warn()    { printf "  \033[33m!\033[0m %s\n" "$1"; }
+# A group is printed only once its check is done, and maybe not at all, so a
+# terminal gets a transient line naming the check that is running.
+progress()       { [[ -t 1 ]] && printf '  \033[2mchecking %s…\033[0m' "$1"; return 0; }
+progress_clear() { [[ -t 1 ]] && printf '\r\033[K'; return 0; }
 join_list() { local sep="$1"; shift; local out="" i; for i in "$@"; do out+="${out:+$sep}$i"; done; printf '%s' "$out"; }
 
 declare -A COUNT=()      # source → number pending
@@ -165,19 +172,24 @@ show_failed() {  # show_failed <source>
   done <<<"${ERRORS[$1]:-}"
 }
 
-report() {  # report <source> <label> — print the cached pending list and count it
-  local src="$1" label="$2" list count
+# Open a source's group and print what it has: failed checks and the pending
+# list. Returns 1, printing nothing, when there is neither and the caller passes
+# no warning of its own — the callers' notes belong to the group, so they stop too.
+report() {  # report <source> [warning to follow]
+  local src="$1" extra="${2:-}" list count
   list="${PENDING[$src]:-}"
   count=$(printf '%s' "$list" | grep -c . )
   COUNT[$src]=$count
+  progress_clear
+  (( count > 0 )) || [[ -n "${ERRORS[$src]:-}$extra" ]] || return 1
+  section "${TITLE[$src]}"
   show_failed "$src"
-  if (( count == 0 )); then
-    [[ -n "${ERRORS[$src]:-}" ]] || ok "up to date"
-  else
-    printf "  %s %s\n" "$count" "$label"
+  if (( count > 0 )); then
+    printf "  %s %s\n" "$count" "${LABEL[$src]}"
     printf '%s\n' "$list" | truncate_list
     TOTAL=$(( TOTAL + count ))
   fi
+  return 0
 }
 
 newer() {
@@ -400,10 +412,11 @@ replay_cache() {  # print the cached results in the live check's layout
   local s count list
   for s in "${ALL_SOURCES[@]}"; do
     wants "$s" || continue
-    section "${TITLE[$s]}"
     count=${COUNT[$s]:-0}; list="${PENDING[$s]:-}"
+    (( count > 0 )) || [[ -n "${ERRORS[$s]:-}" ]] || continue
+    section "${TITLE[$s]}"
     show_failed "$s"
-    if (( count == 0 )); then [[ -n "${ERRORS[$s]:-}" ]] || ok "up to date"; continue; fi
+    (( count > 0 )) || continue
     printf "  %s %s\n" "$count" "${LABEL[$s]}"
     if [[ -n "$list" ]]; then printf '%s\n' "$list" | truncate_list
     else note "    (names not recorded — cache written by an older update-all)"; fi
@@ -448,13 +461,12 @@ apt_pending() {
 }
 
 check_apt() {
-  section "${TITLE[apt]}"
   HOWTO[apt]='sudo apt update && sudo apt full-upgrade'
   local stamp age
   stamp=$(stat -c %Y /var/lib/apt/lists 2>/dev/null || echo 0)
   age=$(( ( $(date +%s) - stamp ) / 3600 ))
   collect apt "$(apt_pending)"
-  report apt "${LABEL[apt]}"
+  report apt || return 0
   note "package lists last refreshed ${age}h ago (apt-daily.timer)"
 }
 
@@ -530,10 +542,9 @@ flatpak_pending() {
 }
 
 check_flatpak() {
-  section "${TITLE[flatpak]}"
   HOWTO[flatpak]='flatpak update'
   collect flatpak "$(flatpak_pending)"
-  report flatpak "${LABEL[flatpak]}"
+  report flatpak || return 0
   local rts
   rts=$(grep -c ' runtime\]$' <<<"${PENDING[flatpak]}")
   if (( rts > 0 )); then
@@ -654,18 +665,22 @@ npm_unsupported() {
 }
 
 check_npm() {
-  section "${TITLE[npm]}"
-  if [[ -z "$NPM" ]]; then warn "npm not found"; COUNT[npm]=0; return 0; fi
+  local unsup="" line cmds=""
+  if [[ -z "$NPM" ]]; then
+    COUNT[npm]=0
+    report npm "npm not found" && warn "npm not found"
+    return 0
+  fi
   collect npm "$(npm_pending)"
-  report npm "${LABEL[npm]}"
-  local cmds=""
+  # not an update, but it needs the operator all the same, so it opens the group
+  unsup=$(npm_unsupported)
+  report npm "$unsup" || return 0
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     cmds+="${cmds:+ && }npm -g install $(awk '{print $1"@"$4}' <<<"$line")"
   done <<<"${PENDING[npm]}"
   HOWTO[npm]="${cmds:-npm -g outdated}"
   note "prefix: $("$NPM" config get prefix 2>/dev/null) · node $("$NODE" -v 2>/dev/null) · ignore-scripts=$("$NPM" config get ignore-scripts 2>/dev/null)"
-  local unsup; unsup=$(npm_unsupported)
   if [[ -n "$unsup" ]]; then
     while IFS= read -r line; do warn "unsupported: $line (yours: $("$NODE" -v))"; done <<<"$unsup"
     note "not an update — a newer node fixes it, or pin back to the last compatible release"
@@ -777,9 +792,8 @@ deb_pending() {
 }
 
 check_deb() {
-  section "${TITLE[deb]}"
   collect deb "$(deb_pending)"
-  report deb "${LABEL[deb]}"
+  report deb || return 0
   local hints=()
   grep -q '^discord' <<<"${PENDING[deb]}" && hints+=("update-discord")
   grep -q '^proton-mail' <<<"${PENDING[deb]}" && hints+=("update-all deb")
@@ -887,9 +901,8 @@ standalone_pending() {
 }
 
 check_standalone() {
-  section "${TITLE[standalone]}"
   collect standalone "$(standalone_pending)"
-  report standalone "${LABEL[standalone]}"
+  report standalone || return 0
   local hints=()
   grep -q '^claude' <<<"${PENDING[standalone]}" && hints+=("claude update")
   grep -q '^grok'   <<<"${PENDING[standalone]}" && hints+=("grok update")
@@ -1016,7 +1029,11 @@ if $FROM_CACHE; then
   replay_cache
 else
   [[ "$USE_CACHE" == always ]] && note "no usable cached result — checking now"
-  for s in "${ALL_SOURCES[@]}"; do wants "$s" && "check_$s"; done
+  for s in "${ALL_SOURCES[@]}"; do
+    wants "$s" || continue
+    progress "${TITLE[$s]}"
+    "check_$s"
+  done
   save_cache
 fi
 

@@ -8,6 +8,8 @@ One report for every update source on this box — **APT**, **Flatpak** (user *a
 apps and runtimes/extensions alike, all named), **global npm** packages, **hand-installed `.deb`s**
 that apt structurally cannot see, and **standalone** tools (`claude` / `codex` / `grok`) that no
 package manager tracks. Checking is read-only and needs no privileges; applying is always explicit.
+Only a source with something to report is shown (pending updates, a failed check, or an unsupported
+npm global); when there is none, the output is the closing "Everything is up to date." line.
 
 Sources: `apt` · `flatpak` · `npm` · `deb` · `standalone`
 
