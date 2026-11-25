@@ -26,7 +26,11 @@ everything), `n` (nothing), or a list of sources to apply — and appears only o
 unattended run reports and stops, which is what makes a "yes" default safe. A plain run reuses the
 last check's results if they are under an hour old.
 
-Exit codes: `0` up to date or applied · `10` pending, not applied · `1` an apply failed.
+A lookup that gets no answer (network down, a tool erroring) is listed as `check failed` under its
+source and is never counted as up to date.
+
+Exit codes: `0` nothing pending (even if a check failed) or applied · `10` pending, not applied ·
+`1` an apply failed.
 
 ### Install
 

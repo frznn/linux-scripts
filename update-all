@@ -35,8 +35,11 @@
 # The point: the daily notification comes from a check that just ran, so
 # clicking it should land on the prompt, not on another 15-second check.
 #
+# FAILED CHECKS: a lookup that gets no answer (network down, tool error) is
+# listed as "check failed" under its source, never counted as up to date.
+#
 # EXIT CODES
-#   0  nothing pending, or everything applied
+#   0  nothing pending (even if a check failed), or everything applied
 #   10 updates are available and were not applied
 #   1  an apply failed
 #
@@ -130,6 +133,7 @@ join_list() { local sep="$1"; shift; local out="" i; for i in "$@"; do out+="${o
 declare -A COUNT=()      # source → number pending
 declare -A PENDING=()    # source → "name  old → new" lines (computed once, reused by apply)
 declare -A HOWTO=()      # source → the command to apply that source by hand
+declare -A ERRORS=()     # source → one line per lookup that failed
 declare -A TITLE=([apt]="APT" [flatpak]="Flatpak" [npm]="npm (global)" [deb]="Hand-installed .debs" [standalone]="Standalone")
 declare -A LABEL=([apt]="package(s) upgradable" [flatpak]="update(s)" [npm]="global package(s)" [deb]="package(s)" [standalone]="tool(s)")
 TOTAL=0
@@ -145,12 +149,31 @@ truncate_list() {
   return 0
 }
 
+# A "pending" producer runs inside $(...), where it cannot set a variable, so it
+# reports a failed lookup in-band as a '!' line; collect() splits the two apart.
+check_failed() { printf '!%s\n' "$1"; }
+
+collect() {  # collect <source> <producer output>
+  PENDING[$1]=$(grep -v '^!' <<<"$2" | grep .)
+  ERRORS[$1]=$(sed -n 's/^!//p' <<<"$2")
+}
+
+show_failed() {  # show_failed <source>
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && warn "check failed: $line"
+  done <<<"${ERRORS[$1]:-}"
+}
+
 report() {  # report <source> <label> — print the cached pending list and count it
   local src="$1" label="$2" list count
   list="${PENDING[$src]:-}"
   count=$(printf '%s' "$list" | grep -c . )
   COUNT[$src]=$count
-  if (( count == 0 )); then ok "up to date"; else
+  show_failed "$src"
+  if (( count == 0 )); then
+    [[ -n "${ERRORS[$src]:-}" ]] || ok "up to date"
+  else
     printf "  %s %s\n" "$count" "$label"
     printf '%s\n' "$list" | truncate_list
     TOTAL=$(( TOTAL + count ))
@@ -344,7 +367,7 @@ save_cache() {
     printf '# update-all results — written %s. Sourced by update-all; do not edit.\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     printf 'CACHED_AT=%s\n' "$(date +%s)"
     printf 'CACHED_SOURCES=(%s)\n' "${SOURCES[*]}"
-    declare -p COUNT PENDING HOWTO
+    declare -p COUNT PENDING HOWTO ERRORS
   } > "$CACHE_FILE.tmp" && mv -f "$CACHE_FILE.tmp" "$CACHE_FILE")
 }
 
@@ -379,7 +402,8 @@ replay_cache() {  # print the cached results in the live check's layout
     wants "$s" || continue
     section "${TITLE[$s]}"
     count=${COUNT[$s]:-0}; list="${PENDING[$s]:-}"
-    if (( count == 0 )); then ok "up to date"; continue; fi
+    show_failed "$s"
+    if (( count == 0 )); then [[ -n "${ERRORS[$s]:-}" ]] || ok "up to date"; continue; fi
     printf "  %s %s\n" "$count" "${LABEL[$s]}"
     if [[ -n "$list" ]]; then printf '%s\n' "$list" | truncate_list
     else note "    (names not recorded — cache written by an older update-all)"; fi
@@ -416,14 +440,20 @@ find_bin() {
 }
 
 # ── APT ──────────────────────────────────────────────────────────────────────
+apt_pending() {
+  local out
+  out=$(apt list --upgradable 2>/dev/null) || { check_failed "apt list --upgradable"; return; }
+  tail -n +2 <<<"$out" \
+    | sed -E 's|^([^/]+)/\S+ (\S+) \S+ \[upgradable from: ([^]]+)\]|\1  \3 → \2|'
+}
+
 check_apt() {
   section "${TITLE[apt]}"
   HOWTO[apt]='sudo apt update && sudo apt full-upgrade'
   local stamp age
   stamp=$(stat -c %Y /var/lib/apt/lists 2>/dev/null || echo 0)
   age=$(( ( $(date +%s) - stamp ) / 3600 ))
-  PENDING[apt]=$(apt list --upgradable 2>/dev/null | tail -n +2 \
-         | sed -E 's|^([^/]+)/\S+ (\S+) \S+ \[upgradable from: ([^]]+)\]|\1  \3 → \2|')
+  collect apt "$(apt_pending)"
   report apt "${LABEL[apt]}"
   note "package lists last refreshed ${age}h ago (apt-daily.timer)"
 }
@@ -475,32 +505,39 @@ apply_apt() {
 }
 
 # ── Flatpak ──────────────────────────────────────────────────────────────────
+# Apps AND runtimes/extensions are listed by name, each tagged with its scope.
+# Runtimes used to be a bare count ("plus 5 runtime/extension update(s)"), which
+# left the notification saying "flatpak: 5" with nothing to say what — and on a
+# day with no app updates that reads as "5 apps, names lost" (2026-09-08).
+# A runtime line is "<id>//<branch>  <version>  [<scope> runtime]": the
+# id//branch form is flatpak's own, and the branch matters because the same id
+# (Platform.GL.default) ships 26.08 and 26.08-extra as two separate updates.
+flatpak_pending() {
+  command -v flatpak >/dev/null 2>&1 || return 0
+  local scope apps="" rts="" a r bad
+  for scope in user system; do
+    bad=false
+    a=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --app --"$scope" \
+          --columns=name,application,version 2>/dev/null) || bad=true
+    r=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --runtime --"$scope" \
+          --columns=application,branch,version 2>/dev/null) || bad=true
+    [[ -n "$a" ]] && apps+=$(sed -E "s/\t/  /g; s/$/  [$scope]/" <<<"$a")$'\n'
+    [[ -n "$r" ]] && rts+=$(awk -F'\t' -v s="$scope" '{ v = ($3 == "" ? "" : $3 "  ");
+                              printf "%s//%s  %s[%s runtime]\n", $1, $2, v, s }' <<<"$r")$'\n'
+    $bad && check_failed "$scope remotes could not be listed"
+  done
+  printf '%s%s' "$apps" "$rts"
+}
+
 check_flatpak() {
   section "${TITLE[flatpak]}"
   HOWTO[flatpak]='flatpak update'
-  # Apps AND runtimes/extensions are listed by name, each tagged with its scope.
-  # Runtimes used to be a bare count ("plus 5 runtime/extension update(s)"), which
-  # left the notification saying "flatpak: 5" with nothing to say what — and on a
-  # day with no app updates that reads as "5 apps, names lost" (2026-09-08).
-  # A runtime line is "<id>//<branch>  <version>  [<scope> runtime]": the
-  # id//branch form is flatpak's own, and the branch matters because the same id
-  # (Platform.GL.default) ships 26.08 and 26.08-extra as two separate updates.
-  local scope apps="" rts="" a r
-  for scope in user system; do
-    a=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --app --"$scope" \
-          --columns=name,application,version 2>/dev/null \
-        | sed -E "s/\t/  /g; s/$/  [$scope]/")
-    r=$(timeout "$NET_TIMEOUT" flatpak remote-ls --updates --runtime --"$scope" \
-          --columns=application,branch,version 2>/dev/null \
-        | awk -F'\t' -v s="$scope" '{ v = ($3 == "" ? "" : $3 "  ");
-                                       printf "%s//%s  %s[%s runtime]\n", $1, $2, v, s }')
-    [[ -n "$a" ]] && apps+="$a"$'\n'
-    [[ -n "$r" ]] && rts+="$r"$'\n'
-  done
-  PENDING[flatpak]=$(printf '%s%s' "$apps" "$rts" | grep . )
+  collect flatpak "$(flatpak_pending)"
   report flatpak "${LABEL[flatpak]}"
-  if [[ -n "$rts" ]]; then
-    note "  $(printf '%s' "$apps" | grep -c .) app(s) + $(printf '%s' "$rts" | grep -c .) runtime/extension(s) — one 'flatpak update' pulls in both"
+  local rts
+  rts=$(grep -c ' runtime\]$' <<<"${PENDING[flatpak]}")
+  if (( rts > 0 )); then
+    note "  $(( COUNT[flatpak] - rts )) app(s) + $rts runtime/extension(s) — one 'flatpak update' pulls in both"
   fi
 }
 
@@ -559,26 +596,34 @@ npm_best_version() {  # <pkg> <current> → "target<TAB>reason"
 }
 
 npm_pending() {
-  [[ -n "$NPM" && -x "$NODE" ]] || return 0
-  local json
+  [[ -n "$NPM" ]] || return 0
+  [[ -x "$NODE" ]] || { check_failed "no node to run npm with"; return; }
+  local json rc installed
   json=$(timeout "$NET_TIMEOUT" "$NPM" outdated -g --depth=0 --json 2>/dev/null)
-  [[ -z "$json" || "$json" == "{}" ]] && return 0
-  printf '%s' "$json" | "$NODE" -e '
+  rc=$?
+  # The exit status alone says nothing: npm exits 1 whenever something is
+  # outdated. A failure is no output at all, or JSON holding an "error" object.
+  if [[ -z "$json" ]]; then (( rc == 0 )) || check_failed "npm outdated -g"; return; fi
+  installed=$(printf '%s' "$json" | "$NODE" -e '
     let raw=""; process.stdin.on("data",d=>raw+=d).on("end",()=>{
-      let o={}; try { o=JSON.parse(raw) } catch(e) { process.exit(0) }
+      let o; try { o=JSON.parse(raw) } catch(e) { process.exit(1) }
+      if (o.error && !o.error.current) process.exit(1)
       for (const [name,v] of Object.entries(o))
         if (v.current) console.log(`${name}\t${v.current}`)
-    })' | while IFS=$'\t' read -r name cur; do
-      local target reason
-      IFS=$'\t' read -r target reason < <(npm_best_version "$name" "$cur")
-      [[ -z "$target" ]] && continue
-      newer "$cur" "$target" || continue
-      if [[ -n "$reason" ]]; then
-        printf '%s  %s → %s   (%s)\n' "$name" "$cur" "$target" "$reason"
-      else
-        printf '%s  %s → %s\n' "$name" "$cur" "$target"
-      fi
-    done
+    })') || { check_failed "npm outdated -g"; return; }
+  local name cur best target reason
+  while IFS=$'\t' read -r name cur; do
+    [[ -n "$name" ]] || continue
+    best=$(npm_best_version "$name" "$cur") || { check_failed "$name: no answer from the npm registry"; continue; }
+    IFS=$'\t' read -r target reason <<<"$best"
+    [[ -z "$target" ]] && continue
+    newer "$cur" "$target" || continue
+    if [[ -n "$reason" ]]; then
+      printf '%s  %s → %s   (%s)\n' "$name" "$cur" "$target" "$reason"
+    else
+      printf '%s  %s → %s\n' "$name" "$cur" "$target"
+    fi
+  done <<<"$installed"
 }
 
 # Globals whose INSTALLED version declares an engines.node this node doesn't
@@ -611,7 +656,7 @@ npm_unsupported() {
 check_npm() {
   section "${TITLE[npm]}"
   if [[ -z "$NPM" ]]; then warn "npm not found"; COUNT[npm]=0; return 0; fi
-  PENDING[npm]=$(npm_pending)
+  collect npm "$(npm_pending)"
   report npm "${LABEL[npm]}"
   local cmds=""
   while IFS= read -r line; do
@@ -711,23 +756,29 @@ proton_feed() {  # → version <tab> url <tab> sha512   (newest release this ins
 }
 
 deb_pending() {
-  local have want ud chan
-  if ud=$(find_update_discord); then
-    timeout "$NET_TIMEOUT" "$ud" --check --no-notify 2>/dev/null \
-      | sed -nE 's/^Update available: (\S+) -> (\S+)$/discord  \1 → \2/p'
+  local have want ud out chan
+  if dpkg-query -W discord >/dev/null 2>&1; then
+    if ud=$(find_update_discord) && out=$(timeout "$NET_TIMEOUT" "$ud" --check --no-notify 2>/dev/null); then
+      sed -nE 's/^Update available: (\S+) -> (\S+)$/discord  \1 → \2/p' <<<"$out"
+    else
+      check_failed "discord: update-discord --check"
+    fi
   fi
   if have=$(dpkg-query -W -f='${Version}' proton-mail 2>/dev/null); then
     want=$(proton_feed | cut -f1)
     chan=$(proton_channels); chan="${chan##* }"   # the widest channel in play
-    [[ -n "$want" ]] && dpkg --compare-versions "$have" lt "$want" \
-      && printf 'proton-mail  %s → %s%s\n' "$have" "$want" \
-         "$([[ "$chan" == Stable ]] || echo " ($chan channel)")"
+    if [[ -z "$want" ]]; then
+      check_failed "proton-mail: no release read from the Proton feed"
+    elif dpkg --compare-versions "$have" lt "$want"; then
+      printf 'proton-mail  %s → %s%s\n' "$have" "$want" \
+        "$([[ "$chan" == Stable ]] || echo " ($chan channel)")"
+    fi
   fi
 }
 
 check_deb() {
   section "${TITLE[deb]}"
-  PENDING[deb]=$(deb_pending)
+  collect deb "$(deb_pending)"
   report deb "${LABEL[deb]}"
   local hints=()
   grep -q '^discord' <<<"${PENDING[deb]}" && hints+=("update-discord")
@@ -801,32 +852,43 @@ standalone_pending() {
   if bin=$(find_bin claude); then
     have=$("$bin" --version 2>/dev/null | grep -oE '^[0-9.]+')
     want=$(claude_release)
-    [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" \
-      && printf 'claude  %s → %s%s\n' "$have" "$want" \
-         "$([[ "$CLAUDE_CHANNEL" == latest ]] || echo " ($CLAUDE_CHANNEL channel)")"
+    if [[ -z "$have" || -z "$want" ]]; then
+      check_failed "claude: installed or latest version unknown"
+    elif newer "$have" "$want"; then
+      printf 'claude  %s → %s%s\n' "$have" "$want" \
+        "$([[ "$CLAUDE_CHANNEL" == latest ]] || echo " ($CLAUDE_CHANNEL channel)")"
+    fi
   fi
   if bin=$(find_bin codex); then
     have=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
     want=$(codex_release)
-    [[ -n "$have" && -n "$want" ]] && newer "$have" "$want" && printf 'codex  %s → %s\n' "$have" "$want"
+    if [[ -z "$have" || -z "$want" ]]; then
+      check_failed "codex: installed or latest version unknown"
+    elif newer "$have" "$want"; then
+      printf 'codex  %s → %s\n' "$have" "$want"
+    fi
     # A lone binary without the code-mode host runs no tools; say so.
     [[ -x "$(dirname "$(readlink -f "$bin")")/codex-code-mode-host" ]] \
       || printf 'codex  %s → %s (reinstall as release package: no code-mode host)\n' "${have:-?}" "${want:-?}"
   fi
   if bin=$(find_bin grok); then
-    local json
+    local json rc
     json=$(timeout "$NET_TIMEOUT" "$bin" update --check --json 2>/dev/null)
+    rc=$?
     if [[ "$json" == *'"updateAvailable":true'* ]]; then
       have=$(sed -nE 's/.*"currentVersion":"([^"]+)".*/\1/p' <<<"$json")
       want=$(sed -nE 's/.*"latestVersion":"([^"]+)".*/\1/p' <<<"$json")
       printf 'grok  %s → %s\n' "$have" "$want"
+    # grok exits 0 when its lookup fails, and says so only in "error"
+    elif (( rc != 0 )) || [[ "$json" != *'"updateAvailable":false'* || "$json" == *'"error":"'* ]]; then
+      check_failed "grok: update --check"
     fi
   fi
 }
 
 check_standalone() {
   section "${TITLE[standalone]}"
-  PENDING[standalone]=$(standalone_pending)
+  collect standalone "$(standalone_pending)"
   report standalone "${LABEL[standalone]}"
   local hints=()
   grep -q '^claude' <<<"${PENDING[standalone]}" && hints+=("claude update")
@@ -946,7 +1008,7 @@ if [[ "$USE_CACHE" != never ]] && cache_trusted; then
   if cache_covers && { [[ "$USE_CACHE" == always ]] || (( $(cache_age) <= CACHE_TTL )); }; then
     FROM_CACHE=true
   else
-    COUNT=(); PENDING=(); HOWTO=()
+    COUNT=(); PENDING=(); HOWTO=(); ERRORS=()
   fi
 fi
 if $FROM_CACHE; then
@@ -966,7 +1028,16 @@ done
 
 echo
 if (( TOTAL == 0 )); then
-  printf "\033[1;32mEverything is up to date.\033[0m\n"
+  # a cached result may cover more sources than this run asked for
+  unchecked=()
+  for s in "${ALL_SOURCES[@]}"; do
+    wants "$s" && [[ -n "${ERRORS[$s]:-}" ]] && unchecked+=("$s")
+  done
+  if (( ${#unchecked[@]} )); then
+    printf "\033[1;33mNothing pending, but a check failed\033[0m — %s (see above)\n" "$(join_list ', ' "${unchecked[@]}")"
+  else
+    printf "\033[1;32mEverything is up to date.\033[0m\n"
+  fi
   exit 0
 fi
 
