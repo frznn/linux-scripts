@@ -107,9 +107,13 @@ download_latest_deb() {
 }
 
 latest_url="$(get_latest_url)"
-latest_version="$(basename "$latest_url" | sed -E 's/^discord-([0-9.]+)\.deb$/\1/')"
+# The version is the directory holding the .deb: both the old
+# `…/linux/<version>/discord-<version>.deb` and the current
+# `…/linux/x64/<version>/Discord.deb` put it there, while the file name
+# changed. Anything else prints nothing, which is the failure below.
+latest_version="$(sed -nE 's#.*/([0-9]+(\.[0-9]+)+)/[^/]+\.deb$#\1#p' <<<"$latest_url")"
 
-if [[ -z "$latest_version" || "$latest_version" == "$(basename "$latest_url")" ]]; then
+if [[ -z "$latest_version" ]]; then
   echo "Could not determine latest Discord version from URL: $latest_url" >&2
   exit 1
 fi
