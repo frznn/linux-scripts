@@ -577,9 +577,23 @@ check_flatpak() {
 
 apply_flatpak() {
   section "Flatpak — applying"
-  local bad=false
-  flatpak update -y --user   || { warn "flatpak --user failed"; bad=true; }
-  flatpak update -y --system || { warn "flatpak --system failed (polkit auth?)"; bad=true; }
+  local bad=false scope log
+  mkdir -p "$CACHE_DIR" || true
+  log="$CACHE_DIR/flatpak-last.log"
+  : > "$log"
+  for scope in user system; do
+    flatpak update -y --"$scope" 2>&1 | tee -a "$log"
+    if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+      warn "flatpak --$scope failed$([[ $scope == system ]] && printf ' (polkit auth?)')"; bad=true
+    fi
+  done
+  # An unreachable remote is not an error to flatpak: it warns "Treating remote
+  # fetch error as non-fatal … No such ref" for every installed ref, prints
+  # "Nothing to do." and exits 0 — so the exit status alone reports a run that
+  # installed nothing, because it never saw the remote, as a success.
+  if grep -q 'Treating remote fetch error as non-fatal' "$log"; then
+    warn "flatpak could not reach its remote — nothing was updated; re-run when online"; bad=true
+  fi
   $bad && FAILED=true || ok "flatpak done"
   note "unused runtimes can be reclaimed with: flatpak uninstall --unused"
 }
