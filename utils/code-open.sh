@@ -4,7 +4,8 @@
 #
 #   code-open FILE...   open each file in the window of its project folder: the
 #                       nearest ancestor holding a `.ai` (a context scope), else
-#                       the enclosing git repository, else the file's own directory
+#                       the enclosing git repository, else the file's own directory.
+#                       A directory opens as a window of its own folder
 #   code-open --url URL open a vscode://file/<path>[:line[:col]] link the same way
 #                       (what a chat link click runs); any other vscode:// URL is
 #                       passed to VSCode's own handler
@@ -79,13 +80,26 @@ refuse_stale_instance() {
   exit 1
 }
 
+# open_target PATH [:LINE[:COL]] — open a file in its project folder's window, and
+# a directory as the window's own folder. A directory must be the only folder on
+# the command line: given a second one, even after -g, VSCode builds an untitled
+# workspace of both, and restores it at later starts if it was in the last window
+# closed. A position means nothing for a directory and is dropped.
+open_target() {
+  if [[ -d $1 ]]; then
+    /usr/bin/code "$1"
+  else
+    /usr/bin/code "$(scope_of "$(dirname -- "$1")")" -g "$1${2:-}"
+  fi
+}
+
 open_files() {
   local f
   refuse_stale_instance
   for f in "$@"; do
     # -s: keep symlinks unresolved, since a scope's `.ai` is itself a link into the state
     f=$(realpath -s -- "$f") || continue
-    /usr/bin/code "$(scope_of "$(dirname -- "$f")")" -g "$f"
+    open_target "$f"
   done
 }
 
@@ -107,7 +121,7 @@ open_url() {
   fi
   path=$(realpath -s -- "$path") || exit 1
   refuse_stale_instance
-  /usr/bin/code "$(scope_of "$(dirname -- "$path")")" -g "$path$pos"
+  open_target "$path" "$pos"
 }
 
 sync_associations() {

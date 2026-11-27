@@ -210,7 +210,7 @@ The cost: every HTML file that any application opens goes through the picker fir
 
 ## code-open
 
-Opens files in VSCode together with their project folder (the nearest ancestor holding a `.ai`, else the file's directory), so a terminal or AI session started there gets that folder as cwd. `code-open --url vscode://file/<path>:line:col` does the same for a link (other `vscode://` URLs pass to VSCode's own handler). `code-open --sync` makes it the default app for a user-editable set of extensions and for `vscode://` links, so a chat link opens in a new window unless one already has that folder open.
+Opens files in VSCode together with their project folder (the nearest ancestor holding a `.ai`, else the file's directory), so a terminal or AI session started there gets that folder as cwd. A directory opens as a window of its own folder. `code-open --url vscode://file/<path>:line:col` does the same for a link (other `vscode://` URLs pass to VSCode's own handler). `code-open --sync` makes it the default app for a user-editable set of extensions and for `vscode://` links, so a chat link opens in a new window unless one already has that folder open.
 
 ### Install
 
